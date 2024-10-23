@@ -141,19 +141,18 @@
 //!
 //! [pinned]: https://doc.rust-lang.org/std/pin/index.html
 
+#![feature(allocator_api)]
+#![feature(iter_collect_into)]
+
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::comparison_chain, clippy::missing_safety_doc)]
 
 extern crate alloc;
 
 use alloc::alloc::*;
-use alloc::{boxed::Box, vec::Vec};
 use core::borrow::*;
 use core::cmp::*;
-use core::convert::TryFrom;
-use core::convert::TryInto;
 use core::hash::*;
-use core::iter::FromIterator;
 use core::marker::PhantomData;
 use core::ops::Bound;
 use core::ops::{Deref, DerefMut, RangeBounds};
@@ -410,11 +409,14 @@ fn layout<T>(cap: usize) -> Layout {
 /// # Panics
 ///
 /// Panics if the required size overflows `isize::MAX`.
-fn header_with_capacity<T>(cap: usize) -> NonNull<Header> {
+fn header_with_capacity<T, A: Allocator>(cap: usize, alloc: &A) -> NonNull<Header> {
     debug_assert!(cap > 0);
     unsafe {
         let layout = layout::<T>(cap);
-        let header = alloc(layout) as *mut Header;
+        let header = match alloc.allocate(layout) {
+            Ok(x)   => x.cast::<u8>().as_ptr() as *mut Header,
+            Err(_)  => ptr::null_mut()
+        };
 
         if header.is_null() {
             handle_alloc_error(layout)
@@ -434,9 +436,10 @@ fn header_with_capacity<T>(cap: usize) -> NonNull<Header> {
 
 /// See the crate's top level documentation for a description of this type.
 #[repr(C)]
-pub struct ThinVec<T> {
-    ptr: NonNull<Header>,
-    boo: PhantomData<T>,
+pub struct ThinVec<T, A: Allocator=Global> {
+    ptr     : NonNull<Header>,
+    alloc   : A,
+    boo     : PhantomData<T>,
 }
 
 unsafe impl<T: Sync> Sync for ThinVec<T> {}
@@ -479,12 +482,12 @@ macro_rules! thin_vec {
     ($($x:expr,)*) => (thin_vec![$($x),*]);
 }
 
-impl<T> ThinVec<T> {
+impl<T> ThinVec<T, Global> {
     /// Creates a new empty ThinVec.
     ///
     /// This will not allocate.
     pub fn new() -> ThinVec<T> {
-        ThinVec::with_capacity(0)
+        ThinVec::with_capacity_in(0, Global)
     }
 
     /// Constructs a new, empty `ThinVec<T>` with at least the specified capacity.
@@ -542,6 +545,73 @@ impl<T> ThinVec<T> {
     /// // assert_eq!(vec_units.capacity(), usize::MAX);
     /// ```
     pub fn with_capacity(cap: usize) -> ThinVec<T> {
+        ThinVec::with_capacity_in(cap, Global)
+    }
+}
+
+impl<T, A: Allocator> ThinVec<T, A> {
+    /// Creates a new empty ThinVec.
+    ///
+    /// This will not allocate.
+    pub fn new_in(alloc: A) -> ThinVec<T, A> {
+        ThinVec::with_capacity_in(0, alloc)
+    }
+
+    /// Constructs a new, empty `ThinVec<T>` with at least the specified capacity.
+    ///
+    /// The vector will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the vector will not allocate.
+    ///
+    /// It is important to note that although the returned vector has the
+    /// minimum *capacity* specified, the vector will have a zero *length*.
+    ///
+    /// If it is important to know the exact allocated capacity of a `ThinVec`,
+    /// always use the [`capacity`] method after construction.
+    ///
+    /// **NOTE**: unlike `Vec`, `ThinVec` **MUST** allocate once to keep track of non-zero
+    /// lengths. As such, we cannot provide the same guarantees about ThinVecs
+    /// of ZSTs not allocating. However the allocation never needs to be resized
+    /// to add more ZSTs, since the underlying array is still length 0.
+    ///
+    /// [Capacity and reallocation]: #capacity-and-reallocation
+    /// [`capacity`]: Vec::capacity
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity exceeds `isize::MAX` bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use thin_vec::ThinVec;
+    ///
+    /// let mut vec = ThinVec::with_capacity(10);
+    ///
+    /// // The vector contains no items, even though it has capacity for more
+    /// assert_eq!(vec.len(), 0);
+    /// assert!(vec.capacity() >= 10);
+    ///
+    /// // These are all done without reallocating...
+    /// for i in 0..10 {
+    ///     vec.push(i);
+    /// }
+    /// assert_eq!(vec.len(), 10);
+    /// assert!(vec.capacity() >= 10);
+    ///
+    /// // ...but this may make the vector reallocate
+    /// vec.push(11);
+    /// assert_eq!(vec.len(), 11);
+    /// assert!(vec.capacity() >= 11);
+    ///
+    /// // A vector of a zero-sized type will always over-allocate, since no
+    /// // space is needed to store the actual elements.
+    /// let vec_units = ThinVec::<()>::with_capacity(10);
+    ///
+    /// // Only true **without** the gecko-ffi feature!
+    /// // assert_eq!(vec_units.capacity(), usize::MAX);
+    /// ```
+    pub fn with_capacity_in(cap: usize, alloc: A) -> ThinVec<T, A> {
         // `padding` contains ~static assertions against types that are
         // incompatible with the current feature flags. We also call it to
         // invoke these assertions when getting a pointer to the `ThinVec`
@@ -554,14 +624,16 @@ impl<T> ThinVec<T> {
         if cap == 0 {
             unsafe {
                 ThinVec {
-                    ptr: NonNull::new_unchecked(&EMPTY_HEADER as *const Header as *mut Header),
-                    boo: PhantomData,
+                    ptr     : NonNull::new_unchecked(&EMPTY_HEADER as *const Header as *mut Header),
+                    alloc   : alloc,
+                    boo     : PhantomData,
                 }
             }
         } else {
             ThinVec {
-                ptr: header_with_capacity::<T>(cap),
-                boo: PhantomData,
+                ptr     : header_with_capacity::<T, A>(cap, &alloc),
+                alloc   : alloc,
+                boo     : PhantomData,
             }
         }
     }
@@ -571,9 +643,11 @@ impl<T> ThinVec<T> {
     fn ptr(&self) -> *mut Header {
         self.ptr.as_ptr()
     }
+
     fn header(&self) -> &Header {
         unsafe { self.ptr.as_ref() }
     }
+    
     fn data_raw(&self) -> *mut T {
         // `padding` contains ~static assertions against types that are
         // incompatible with the current feature flags. Even if we don't
@@ -1173,7 +1247,27 @@ impl<T> ThinVec<T> {
         let new_cap = self.len();
         if new_cap < old_cap {
             if new_cap == 0 {
-                *self = ThinVec::new();
+                #[cold]
+                #[inline(never)]
+                fn drop_non_singleton<T, A: Allocator>(this: &mut ThinVec<T, A>) {
+                    unsafe {
+                        ptr::drop_in_place(&mut this[..]);
+
+                        #[cfg(feature = "gecko-ffi")]
+                        if this.ptr.as_ref().uses_stack_allocated_buffer() {
+                            return;
+                        }
+
+                        this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()))
+                    }
+                }
+
+                unsafe {
+                    drop_non_singleton(self);
+
+                    self.ptr = NonNull::new_unchecked(&EMPTY_HEADER as *const Header as *mut Header);
+                }
+
             } else {
                 unsafe {
                     self.reallocate(new_cap);
@@ -1423,7 +1517,7 @@ impl<T> ThinVec<T> {
     /// v.drain(..);
     /// assert_eq!(v, &[]);
     /// ```
-    pub fn drain<R>(&mut self, range: R) -> Drain<'_, T>
+    pub fn drain<R>(&mut self, range: R) -> Drain<'_, T, A>
     where
         R: RangeBounds<usize>,
     {
@@ -1494,7 +1588,7 @@ impl<T> ThinVec<T> {
     /// assert_eq!(u, &[2, 3]);
     /// ```
     #[inline]
-    pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<'_, I::IntoIter>
+    pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<'_, I::IntoIter, A>
     where
         R: RangeBounds<usize>,
         I: IntoIterator<Item = T>,
@@ -1523,7 +1617,7 @@ impl<T> ThinVec<T> {
             (*ptr).set_cap(new_cap);
             self.ptr = NonNull::new_unchecked(ptr);
         } else {
-            let new_header = header_with_capacity::<T>(new_cap);
+            let new_header = header_with_capacity::<T, A>(new_cap, &self.alloc);
 
             // If we get here and have a non-zero len, then we must be handling
             // a gecko auto array, and we have items in a stack buffer. We shouldn't
@@ -1580,7 +1674,7 @@ impl<T> ThinVec<T> {
     }
 }
 
-impl<T: Clone> ThinVec<T> {
+impl<T: Clone, A: Allocator> ThinVec<T, A> {
     /// Resizes the `Vec` in-place so that `len()` is equal to `new_len`.
     ///
     /// If `new_len` is greater than `len()`, the `Vec` is extended by the
@@ -1647,7 +1741,7 @@ impl<T: Clone> ThinVec<T> {
     }
 }
 
-impl<T: PartialEq> ThinVec<T> {
+impl<T: PartialEq, A: Allocator> ThinVec<T, A> {
     /// Removes consecutive repeated elements in the vector.
     ///
     /// If the vector is sorted, this removes all duplicates.
@@ -1671,12 +1765,12 @@ impl<T: PartialEq> ThinVec<T> {
     }
 }
 
-impl<T> Drop for ThinVec<T> {
+impl<T, A: Allocator> Drop for ThinVec<T, A> {
     #[inline]
     fn drop(&mut self) {
         #[cold]
         #[inline(never)]
-        fn drop_non_singleton<T>(this: &mut ThinVec<T>) {
+        fn drop_non_singleton<T, A: Allocator>(this: &mut ThinVec<T, A>) {
             unsafe {
                 ptr::drop_in_place(&mut this[..]);
 
@@ -1685,7 +1779,7 @@ impl<T> Drop for ThinVec<T> {
                     return;
                 }
 
-                dealloc(this.ptr() as *mut u8, layout::<T>(this.capacity()))
+                this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()))
             }
         }
 
@@ -1695,7 +1789,7 @@ impl<T> Drop for ThinVec<T> {
     }
 }
 
-impl<T> Deref for ThinVec<T> {
+impl<T, A: Allocator> Deref for ThinVec<T, A> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -1703,31 +1797,31 @@ impl<T> Deref for ThinVec<T> {
     }
 }
 
-impl<T> DerefMut for ThinVec<T> {
+impl<T, A: Allocator> DerefMut for ThinVec<T, A> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T> Borrow<[T]> for ThinVec<T> {
+impl<T, A: Allocator> Borrow<[T]> for ThinVec<T, A> {
     fn borrow(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T> BorrowMut<[T]> for ThinVec<T> {
+impl<T, A: Allocator> BorrowMut<[T]> for ThinVec<T, A> {
     fn borrow_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T> AsRef<[T]> for ThinVec<T> {
+impl<T, A: Allocator> AsRef<[T]> for ThinVec<T, A> {
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T> Extend<T> for ThinVec<T> {
+impl<T, A: Allocator> Extend<T> for ThinVec<T, A> {
     #[inline]
     fn extend<I>(&mut self, iter: I)
     where
@@ -1750,7 +1844,7 @@ impl<T: fmt::Debug> fmt::Debug for ThinVec<T> {
     }
 }
 
-impl<T> Hash for ThinVec<T>
+impl<T, A: Allocator> Hash for ThinVec<T, A>
 where
     T: Hash,
 {
@@ -1762,47 +1856,47 @@ where
     }
 }
 
-impl<T> PartialOrd for ThinVec<T>
+impl<T, A: Allocator> PartialOrd for ThinVec<T, A>
 where
     T: PartialOrd,
 {
     #[inline]
-    fn partial_cmp(&self, other: &ThinVec<T>) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &ThinVec<T, A>) -> Option<Ordering> {
         self[..].partial_cmp(&other[..])
     }
 }
 
-impl<T> Ord for ThinVec<T>
+impl<T, A: Allocator> Ord for ThinVec<T, A>
 where
     T: Ord,
 {
     #[inline]
-    fn cmp(&self, other: &ThinVec<T>) -> Ordering {
+    fn cmp(&self, other: &ThinVec<T, A>) -> Ordering {
         self[..].cmp(&other[..])
     }
 }
 
-impl<A, B> PartialEq<ThinVec<B>> for ThinVec<A>
+impl<A, B, Alloc: Allocator> PartialEq<ThinVec<B, Alloc>> for ThinVec<A, Alloc>
 where
     A: PartialEq<B>,
 {
     #[inline]
-    fn eq(&self, other: &ThinVec<B>) -> bool {
+    fn eq(&self, other: &ThinVec<B, Alloc>) -> bool {
         self[..] == other[..]
     }
 }
 
-impl<A, B> PartialEq<Vec<B>> for ThinVec<A>
+impl<A, B, Alloc: Allocator> PartialEq<Vec<B, Alloc>> for ThinVec<A, Alloc>
 where
     A: PartialEq<B>,
 {
     #[inline]
-    fn eq(&self, other: &Vec<B>) -> bool {
+    fn eq(&self, other: &Vec<B, Alloc>) -> bool {
         self[..] == other[..]
     }
 }
 
-impl<A, B> PartialEq<[B]> for ThinVec<A>
+impl<A, B, Alloc: Allocator> PartialEq<[B]> for ThinVec<A, Alloc>
 where
     A: PartialEq<B>,
 {
@@ -1812,64 +1906,13 @@ where
     }
 }
 
-impl<'a, A, B> PartialEq<&'a [B]> for ThinVec<A>
+impl<'a, A, B, Alloc: Allocator> PartialEq<&'a [B]> for ThinVec<A, Alloc>
 where
     A: PartialEq<B>,
 {
     #[inline]
     fn eq(&self, other: &&'a [B]) -> bool {
         self[..] == other[..]
-    }
-}
-
-// Serde impls based on
-// https://github.com/bluss/arrayvec/blob/67ec907a98c0f40c4b76066fed3c1af59d35cf6a/src/arrayvec.rs#L1222-L1267
-#[cfg(feature = "serde")]
-impl<T: serde::Serialize> serde::Serialize for ThinVec<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.collect_seq(self.as_slice())
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ThinVec<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{SeqAccess, Visitor};
-        use serde::Deserialize;
-
-        struct ThinVecVisitor<T>(PhantomData<T>);
-
-        impl<'de, T: Deserialize<'de>> Visitor<'de> for ThinVecVisitor<T> {
-            type Value = ThinVec<T>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "a sequence")
-            }
-
-            fn visit_seq<SA>(self, mut seq: SA) -> Result<Self::Value, SA::Error>
-            where
-                SA: SeqAccess<'de>,
-            {
-                // Same policy as
-                // https://github.com/serde-rs/serde/blob/ce0844b9ecc32377b5e4545d759d385a8c46bc6a/serde/src/private/size_hint.rs#L13
-                let initial_capacity = seq.size_hint().unwrap_or_default().min(4096);
-                let mut values = ThinVec::<T>::with_capacity(initial_capacity);
-
-                while let Some(value) = seq.next_element()? {
-                    values.push(value);
-                }
-
-                Ok(values)
-            }
-        }
-
-        deserializer.deserialize_seq(ThinVecVisitor::<T>(PhantomData))
     }
 }
 
@@ -1894,13 +1937,13 @@ array_impls! {
     30 31 32
 }
 
-impl<T> Eq for ThinVec<T> where T: Eq {}
+impl<T, A: Allocator> Eq for ThinVec<T, A> where T: Eq {}
 
-impl<T> IntoIterator for ThinVec<T> {
+impl<T, A: Allocator> IntoIterator for ThinVec<T, A> {
     type Item = T;
-    type IntoIter = IntoIter<T>;
+    type IntoIter = IntoIter<T, A>;
 
-    fn into_iter(self) -> IntoIter<T> {
+    fn into_iter(self) -> IntoIter<T, A> {
         IntoIter {
             vec: self,
             start: 0,
@@ -1908,7 +1951,7 @@ impl<T> IntoIterator for ThinVec<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a ThinVec<T> {
+impl<'a, T, A: Allocator> IntoIterator for &'a ThinVec<T, A> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
 
@@ -1917,7 +1960,7 @@ impl<'a, T> IntoIterator for &'a ThinVec<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a mut ThinVec<T> {
+impl<'a, T, A: Allocator> IntoIterator for &'a mut ThinVec<T, A> {
     type Item = &'a mut T;
     type IntoIter = slice::IterMut<'a, T>;
 
@@ -1926,17 +1969,18 @@ impl<'a, T> IntoIterator for &'a mut ThinVec<T> {
     }
 }
 
-impl<T> Clone for ThinVec<T>
+impl<T, A> Clone for ThinVec<T, A>
 where
     T: Clone,
+    A: Clone + Allocator
 {
     #[inline]
-    fn clone(&self) -> ThinVec<T> {
+    fn clone(&self) -> ThinVec<T, A> {
         #[cold]
         #[inline(never)]
-        fn clone_non_singleton<T: Clone>(this: &ThinVec<T>) -> ThinVec<T> {
+        fn clone_non_singleton<T: Clone, A: Clone + Allocator>(this: &ThinVec<T, A>) -> ThinVec<T, A> {
             let len = this.len();
-            let mut new_vec = ThinVec::<T>::with_capacity(len);
+            let mut new_vec = ThinVec::<T, A>::with_capacity_in(len, this.alloc.clone());
             let mut data_raw = new_vec.data_raw();
             for x in this.iter() {
                 unsafe {
@@ -1953,7 +1997,7 @@ where
         }
 
         if self.is_singleton() {
-            ThinVec::new()
+            ThinVec::new_in(self.alloc.clone())
         } else {
             clone_non_singleton(self)
         }
@@ -2021,7 +2065,7 @@ impl<T, const N: usize> From<[T; N]> for ThinVec<T> {
     }
 }
 
-impl<T> From<Box<[T]>> for ThinVec<T> {
+impl<T, A: Allocator> From<Box<[T], A>> for ThinVec<T> {
     /// Convert a boxed slice into a vector by transferring ownership of
     /// the existing heap allocation.
     ///
@@ -2035,13 +2079,13 @@ impl<T> From<Box<[T]>> for ThinVec<T> {
     /// let b: Box<[i32]> = thin_vec![1, 2, 3].into_iter().collect();
     /// assert_eq!(ThinVec::from(b), thin_vec![1, 2, 3]);
     /// ```
-    fn from(s: Box<[T]>) -> Self {
+    fn from(s: Box<[T], A>) -> Self {
         // Can just lean on the fact that `Box<[T]>` -> `Vec<T>` is Free.
         Vec::from(s).into_iter().collect()
     }
 }
 
-impl<T> From<Vec<T>> for ThinVec<T> {
+impl<T, A: Allocator> From<Vec<T, A>> for ThinVec<T> {
     /// Convert a `std::Vec` into a `ThinVec`.
     ///
     /// **NOTE:** this must reallocate to change the layout!
@@ -2054,12 +2098,12 @@ impl<T> From<Vec<T>> for ThinVec<T> {
     /// let b: Vec<i32> = vec![1, 2, 3];
     /// assert_eq!(ThinVec::from(b), thin_vec![1, 2, 3]);
     /// ```
-    fn from(s: Vec<T>) -> Self {
+    fn from(s: Vec<T, A>) -> Self {
         s.into_iter().collect()
     }
 }
 
-impl<T> From<ThinVec<T>> for Vec<T> {
+impl<T, A: Allocator> From<ThinVec<T, A>> for Vec<T> {
     /// Convert a `ThinVec` into a `std::Vec`.
     ///
     /// **NOTE:** this must reallocate to change the layout!
@@ -2072,12 +2116,12 @@ impl<T> From<ThinVec<T>> for Vec<T> {
     /// let b: ThinVec<i32> = thin_vec![1, 2, 3];
     /// assert_eq!(Vec::from(b), vec![1, 2, 3]);
     /// ```
-    fn from(s: ThinVec<T>) -> Self {
+    fn from(s: ThinVec<T, A>) -> Self {
         s.into_iter().collect()
     }
 }
 
-impl<T> From<ThinVec<T>> for Box<[T]> {
+impl<T, A: Allocator> From<ThinVec<T, A>> for Box<[T]> {
     /// Convert a vector into a boxed slice.
     ///
     /// If `v` has excess capacity, its items will be moved into a
@@ -2091,7 +2135,7 @@ impl<T> From<ThinVec<T>> for Box<[T]> {
     /// use thin_vec::{ThinVec, thin_vec};
     /// assert_eq!(Box::from(thin_vec![1, 2, 3]), thin_vec![1, 2, 3].into_iter().collect());
     /// ```
-    fn from(v: ThinVec<T>) -> Self {
+    fn from(v: ThinVec<T, A>) -> Self {
         v.into_iter().collect()
     }
 }
@@ -2180,12 +2224,12 @@ impl<T, const N: usize> TryFrom<ThinVec<T>> for [T; N] {
 /// let v = thin_vec![0, 1, 2];
 /// let iter: thin_vec::IntoIter<_> = v.into_iter();
 /// ```
-pub struct IntoIter<T> {
-    vec: ThinVec<T>,
+pub struct IntoIter<T, A: Allocator=Global> {
+    vec: ThinVec<T, A>,
     start: usize,
 }
 
-impl<T> IntoIter<T> {
+impl<T, A: Allocator> IntoIter<T, A> {
     /// Returns the remaining items of this iterator as a slice.
     ///
     /// # Examples
@@ -2227,7 +2271,7 @@ impl<T> IntoIter<T> {
     }
 }
 
-impl<T> Iterator for IntoIter<T> {
+impl<T, A: Allocator> Iterator for IntoIter<T, A> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         if self.start == self.vec.len() {
@@ -2247,7 +2291,7 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
-impl<T> DoubleEndedIterator for IntoIter<T> {
+impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
     fn next_back(&mut self) -> Option<T> {
         if self.start == self.vec.len() {
             None
@@ -2257,24 +2301,29 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
     }
 }
 
-impl<T> ExactSizeIterator for IntoIter<T> {}
+impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
 
-impl<T> core::iter::FusedIterator for IntoIter<T> {}
+impl<T, A: Allocator> core::iter::FusedIterator for IntoIter<T, A> {}
 
 // SAFETY: the length calculation is trivial, we're an array! And if it's wrong we're So Screwed.
 #[cfg(feature = "unstable")]
-unsafe impl<T> core::iter::TrustedLen for IntoIter<T> {}
+unsafe impl<T, A: Allocator> core::iter::TrustedLen for IntoIter<T, A> {}
 
-impl<T> Drop for IntoIter<T> {
+impl<T, A: Allocator> Drop for IntoIter<T, A> {
     #[inline]
     fn drop(&mut self) {
         #[cold]
         #[inline(never)]
-        fn drop_non_singleton<T>(this: &mut IntoIter<T>) {
+        fn drop_non_singleton<T, A: Allocator>(this: &mut IntoIter<T, A>) {
             unsafe {
-                let mut vec = mem::replace(&mut this.vec, ThinVec::new());
-                ptr::drop_in_place(&mut vec[this.start..]);
-                vec.set_len_non_singleton(0)
+                let entries = std::slice::from_raw_parts_mut(
+                    this.vec.data_raw(),
+                    this.vec.len() - this.start
+                );
+
+                this.vec.set_len_non_singleton(0);
+
+                ptr::drop_in_place(entries);
             }
         }
 
@@ -2284,27 +2333,30 @@ impl<T> Drop for IntoIter<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for IntoIter<T> {
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for IntoIter<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("IntoIter").field(&self.as_slice()).finish()
     }
 }
 
-impl<T> AsRef<[T]> for IntoIter<T> {
+impl<T, A: Allocator> AsRef<[T]> for IntoIter<T, A> {
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T: Clone> Clone for IntoIter<T> {
+impl<T: Clone, A: Clone + Allocator> Clone for IntoIter<T, A> {
     #[allow(clippy::into_iter_on_ref)]
     fn clone(&self) -> Self {
         // Just create a new `ThinVec` from the remaining elements and IntoIter it
+        let mut vec = ThinVec::<_, A>::new_in(self.vec.alloc.clone());
+
         self.as_slice()
             .into_iter()
             .cloned()
-            .collect::<ThinVec<_>>()
-            .into_iter()
+            .collect_into(&mut vec);
+
+        vec.into_iter()
     }
 }
 
@@ -2321,7 +2373,7 @@ impl<T: Clone> Clone for IntoIter<T> {
 /// let mut v = thin_vec![0, 1, 2];
 /// let iter: thin_vec::Drain<_> = v.drain(..);
 /// ```
-pub struct Drain<'a, T> {
+pub struct Drain<'a, T, A: Allocator=Global> {
     // Ok so ThinVec::drain takes a range of the ThinVec and yields the contents by-value,
     // then backshifts the array. During iteration the array is in an unsound state
     // (big deinitialized hole in it), and this is very dangerous.
@@ -2397,14 +2449,14 @@ pub struct Drain<'a, T> {
     ///
     /// Since we set the `len` of this to be before `IterMut`, we can use that `len`
     /// to retrieve the index of the start of the drain range later.
-    vec: *mut ThinVec<T>,
+    vec: *mut ThinVec<T, A>,
     /// The one-past-the-end index of the drain range, or equivalently the start of the tail.
     end: usize,
     /// The length of the tail.
     tail: usize,
 }
 
-impl<'a, T> Iterator for Drain<'a, T> {
+impl<'a, T, A: Allocator> Iterator for Drain<'a, T, A> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.iter.next().map(|x| unsafe { ptr::read(x) })
@@ -2415,21 +2467,21 @@ impl<'a, T> Iterator for Drain<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for Drain<'a, T> {
+impl<'a, T, A: Allocator> DoubleEndedIterator for Drain<'a, T, A> {
     fn next_back(&mut self) -> Option<T> {
         self.iter.next_back().map(|x| unsafe { ptr::read(x) })
     }
 }
 
-impl<'a, T> ExactSizeIterator for Drain<'a, T> {}
+impl<'a, T, A: Allocator> ExactSizeIterator for Drain<'a, T, A> {}
 
 // SAFETY: we need to keep track of this perfectly Or Else anyway!
 #[cfg(feature = "unstable")]
-unsafe impl<T> core::iter::TrustedLen for Drain<'_, T> {}
+unsafe impl<T, A: Allocator> core::iter::TrustedLen for Drain<'_, T, A> {}
 
-impl<T> core::iter::FusedIterator for Drain<'_, T> {}
+impl<T, A: Allocator> core::iter::FusedIterator for Drain<'_, T, A> {}
 
-impl<'a, T> Drop for Drain<'a, T> {
+impl<'a, T, A: Allocator> Drop for Drain<'a, T, A> {
     fn drop(&mut self) {
         // Consume the rest of the iterator.
         for _ in self.by_ref() {}
@@ -2450,13 +2502,13 @@ impl<'a, T> Drop for Drain<'a, T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Drain<'_, T> {
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for Drain<'_, T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Drain").field(&self.iter.as_slice()).finish()
     }
 }
 
-impl<'a, T> Drain<'a, T> {
+impl<'a, T, A: Allocator> Drain<'a, T, A> {
     /// Returns the remaining items of this iterator as a slice.
     ///
     /// # Examples
@@ -2478,7 +2530,7 @@ impl<'a, T> Drain<'a, T> {
     }
 }
 
-impl<'a, T> AsRef<[T]> for Drain<'a, T> {
+impl<'a, T, A: Allocator> AsRef<[T]> for Drain<'a, T, A> {
     fn as_ref(&self) -> &[T] {
         self.as_slice()
     }
@@ -2499,12 +2551,12 @@ impl<'a, T> AsRef<[T]> for Drain<'a, T> {
 /// let iter: thin_vec::Splice<_> = v.splice(1.., new);
 /// ```
 #[derive(Debug)]
-pub struct Splice<'a, I: Iterator + 'a> {
-    drain: Drain<'a, I::Item>,
+pub struct Splice<'a, I: Iterator + 'a, A: Allocator = Global> {
+    drain: Drain<'a, I::Item, A>,
     replace_with: I,
 }
 
-impl<I: Iterator> Iterator for Splice<'_, I> {
+impl<I: Iterator, A: Allocator> Iterator for Splice<'_, I, A> {
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2516,15 +2568,15 @@ impl<I: Iterator> Iterator for Splice<'_, I> {
     }
 }
 
-impl<I: Iterator> DoubleEndedIterator for Splice<'_, I> {
+impl<I: Iterator, A: Allocator> DoubleEndedIterator for Splice<'_, I, A> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.drain.next_back()
     }
 }
 
-impl<I: Iterator> ExactSizeIterator for Splice<'_, I> {}
+impl<I: Iterator, A: Allocator> ExactSizeIterator for Splice<'_, I, A> {}
 
-impl<I: Iterator> Drop for Splice<'_, I> {
+impl<I: Iterator, A: Allocator> Drop for Splice<'_, I, A> {
     fn drop(&mut self) {
         // Ensure we've fully drained out the range
         self.drain.by_ref().for_each(drop);
@@ -2571,7 +2623,7 @@ impl<I: Iterator> Drop for Splice<'_, I> {
 }
 
 /// Private helper methods for `Splice::drop`
-impl<T> Drain<'_, T> {
+impl<T, A: Allocator> Drain<'_, T, A> {
     /// The range from `self.vec.len` to `self.tail_start` contains elements
     /// that have been moved out.
     /// Fill that range as much as possible with new elements from the `replace_with` iterator.
@@ -2615,7 +2667,7 @@ impl<T> Drain<'_, T> {
 /// The vector will grow as needed.
 /// This implementation is identical to the one for `Vec<u8>`.
 #[cfg(feature = "std")]
-impl std::io::Write for ThinVec<u8> {
+impl<A: Allocator> std::io::Write for ThinVec<u8, A> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.extend_from_slice(buf);
@@ -2639,7 +2691,7 @@ impl std::io::Write for ThinVec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{ThinVec, MAX_CAP};
-    use crate::alloc::{string::ToString, vec};
+    use crate::alloc::vec;
 
     #[test]
     fn test_size_of() {
@@ -2669,6 +2721,7 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "gecko-ffi", should_panic)]
     fn test_overaligned_type_is_rejected_for_gecko_ffi_mode() {
+        #[allow(dead_code)]
         #[repr(align(16))]
         struct Align16(u8);
 
@@ -3019,10 +3072,7 @@ mod std_tests {
     #![allow(clippy::reversed_empty_ranges)]
 
     use super::*;
-    use crate::alloc::{
-        format,
-        string::{String, ToString},
-    };
+    use crate::alloc::format;
     use core::mem::size_of;
     use core::usize;
 
@@ -3397,6 +3447,7 @@ mod std_tests {
     #[test]
     fn test_vec_truncate_drop() {
         static mut DROPS: u32 = 0;
+        #[allow(dead_code)]
         struct Elem(i32);
         impl Drop for Elem {
             fn drop(&mut self) {
@@ -4225,37 +4276,6 @@ mod std_tests {
 
         assert_eq!(padding::<Funky<[*mut usize; 1024]>>(), 128 - HEADER_SIZE);
         assert_aligned_head_ptr!(Funky<[*mut usize; 1024]>);
-    }
-
-    #[cfg(feature = "serde")]
-    use serde_test::{assert_tokens, Token};
-
-    #[test]
-    #[cfg(feature = "serde")]
-    fn test_ser_de_empty() {
-        let vec = ThinVec::<u32>::new();
-
-        assert_tokens(&vec, &[Token::Seq { len: Some(0) }, Token::SeqEnd]);
-    }
-
-    #[test]
-    #[cfg(feature = "serde")]
-    fn test_ser_de() {
-        let mut vec = ThinVec::<u32>::new();
-        vec.push(20);
-        vec.push(55);
-        vec.push(123);
-
-        assert_tokens(
-            &vec,
-            &[
-                Token::Seq { len: Some(3) },
-                Token::U32(20),
-                Token::U32(55),
-                Token::U32(123),
-                Token::SeqEnd,
-            ],
-        );
     }
 
     #[test]
