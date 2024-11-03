@@ -697,6 +697,11 @@ impl<T, A: Allocator> ThinVec<T, A> {
         &mut *self.ptr()
     }
 
+    /// Returns the allocator of the vector.
+    pub fn allocator(&self) -> &A {
+        &self.alloc
+    }
+
     /// Returns the number of elements in the vector, also referred to
     /// as its 'length'.
     ///
