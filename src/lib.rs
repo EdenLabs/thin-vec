@@ -442,8 +442,8 @@ pub struct ThinVec<T, A: Allocator=Global> {
     boo     : PhantomData<T>,
 }
 
-unsafe impl<T: Sync> Sync for ThinVec<T> {}
-unsafe impl<T: Send> Send for ThinVec<T> {}
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for ThinVec<T, A> {}
+unsafe impl<T: Send, A: Allocator + Send> Send for ThinVec<T, A> {}
 
 /// Creates a `ThinVec` containing the arguments.
 ///
