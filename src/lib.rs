@@ -1610,11 +1610,25 @@ impl<T, A: Allocator> ThinVec<T, A> {
         debug_assert!(new_cap > 0);
         if self.has_allocation() {
             let old_cap = self.capacity();
-            let ptr = realloc(
-                self.ptr() as *mut u8,
-                layout::<T>(old_cap),
-                alloc_size::<T>(new_cap),
-            ) as *mut Header;
+            let ptr     = {
+                let old_layout = layout::<T>(old_cap);
+                let new_layout = layout::<T>(new_cap);
+
+                // Growing the allocation.
+                if new_cap > old_cap {
+                    match self.alloc.grow(self.ptr.cast(), old_layout, new_layout) {
+                        Ok(x)   => x.as_ptr().cast::<Header>(),
+                        Err(_)  => ptr::null_mut()
+                    }
+                }
+                // Shrinking the allocation.
+                else {
+                    match self.alloc.shrink(self.ptr.cast(), old_layout, new_layout) {
+                        Ok(x)   => x.as_ptr().cast::<Header>(),
+                        Err(_)  => ptr::null_mut()
+                    }
+                }
+            };
 
             if ptr.is_null() {
                 handle_alloc_error(layout::<T>(new_cap))
@@ -2321,13 +2335,8 @@ impl<T, A: Allocator> Drop for IntoIter<T, A> {
         #[inline(never)]
         fn drop_non_singleton<T, A: Allocator>(this: &mut IntoIter<T, A>) {
             unsafe {
-                let entries = std::slice::from_raw_parts_mut(
-                    this.vec.data_raw(),
-                    this.vec.len() - this.start
-                );
-
+                let entries = std::ptr::addr_of_mut!(this.vec[this.start..]);
                 this.vec.set_len_non_singleton(0);
-
                 ptr::drop_in_place(entries);
             }
         }
