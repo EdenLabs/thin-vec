@@ -331,7 +331,13 @@ impl Header {
 /// on size == 0 in every method), but it's a bunch of work for something that
 /// doesn't matter much.
 #[cfg(any(not(feature = "gecko-ffi"), test, miri))]
-static EMPTY_HEADER: Header = Header { _len: 0, _cap: 0 };
+static EMPTY_HEADER : Header = Header { _len: 0, _cap: 0 };
+
+/// A sentinel pointer for the empty header.
+/// 
+/// We can't use the header pointer directly because in some cases the statics used within
+/// the same program may differe. This often happens in situations like hot-reloading Rust.
+const EMPTY         : NonNull<Header> = NonNull::dangling();
 
 #[cfg(all(feature = "gecko-ffi", not(test), not(miri)))]
 extern "C" {
@@ -622,12 +628,10 @@ impl<T, A: Allocator> ThinVec<T, A> {
         let _ = padding::<T>();
 
         if cap == 0 {
-            unsafe {
-                ThinVec {
-                    ptr     : NonNull::new_unchecked(&EMPTY_HEADER as *const Header as *mut Header),
-                    alloc   : alloc,
-                    boo     : PhantomData,
-                }
+            ThinVec {
+                ptr     : EMPTY,
+                alloc   : alloc,
+                boo     : PhantomData,
             }
         } else {
             ThinVec {
@@ -641,11 +645,21 @@ impl<T, A: Allocator> ThinVec<T, A> {
     // Accessor conveniences
 
     fn ptr(&self) -> *mut Header {
-        self.ptr.as_ptr()
+        if self.is_singleton() {
+            &EMPTY_HEADER as *const _ as *mut _
+        }
+        else {
+            self.ptr.as_ptr()
+        }
     }
 
     fn header(&self) -> &Header {
-        unsafe { self.ptr.as_ref() }
+        if self.is_singleton() {
+            &EMPTY_HEADER
+        }
+        else {
+            unsafe { self.ptr.as_ref() }
+        }
     }
     
     fn data_raw(&self) -> *mut T {
@@ -1267,12 +1281,11 @@ impl<T, A: Allocator> ThinVec<T, A> {
                     }
                 }
 
-                unsafe {
+                if !self.is_singleton() {
                     drop_non_singleton(self);
-
-                    self.ptr = NonNull::new_unchecked(&EMPTY_HEADER as *const Header as *mut Header);
                 }
 
+                self.ptr = EMPTY;
             } else {
                 unsafe {
                     self.reallocate(new_cap);
@@ -1662,22 +1675,10 @@ impl<T, A: Allocator> ThinVec<T, A> {
             self.ptr = new_header;
         }
     }
-
-    #[cfg(feature = "gecko-ffi")]
-    #[inline]
-    #[allow(unused_unsafe)]
-    fn is_singleton(&self) -> bool {
-        // NOTE: the tests will complain that this "unsafe" isn't needed, but it *IS*!
-        // In production this refers to an *extern static* which *is* unsafe to reference.
-        // In tests this refers to a local static because we don't have Firefox's codebase
-        // providing the symbol!
-        unsafe { self.ptr.as_ptr() as *const Header == &EMPTY_HEADER }
-    }
-
-    #[cfg(not(feature = "gecko-ffi"))]
+    
     #[inline]
     fn is_singleton(&self) -> bool {
-        self.ptr.as_ptr() as *const Header == &EMPTY_HEADER
+        self.ptr == EMPTY
     }
 
     #[cfg(feature = "gecko-ffi")]
@@ -1798,7 +1799,7 @@ impl<T, A: Allocator> Drop for ThinVec<T, A> {
                     return;
                 }
 
-                this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()))
+                this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()));
             }
         }
 
@@ -2053,7 +2054,6 @@ impl<T: Clone> From<&[T]> for ThinVec<T> {
     }
 }
 
-#[cfg(not(no_global_oom_handling))]
 impl<T: Clone> From<&mut [T]> for ThinVec<T> {
     /// Allocate a `ThinVec<T>` and fill it by cloning `s`'s items.
     ///
