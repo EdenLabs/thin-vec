@@ -697,11 +697,16 @@ impl<T, A: Allocator> ThinVec<T, A> {
             if !empty_header_is_aligned && self.header().cap() == 0 {
                 NonNull::dangling().as_ptr()
             } else {
-                // This could technically result in overflow, but padding
-                // would have to be absurdly large for this to occur.
-                let header_size = mem::size_of::<Header>();
-                let ptr = self.ptr.as_ptr() as *mut u8;
-                ptr.add(header_size + padding) as *mut T
+                if self.has_allocation() {
+                    // This could technically result in overflow, but padding
+                    // would have to be absurdly large for this to occur.
+                    let header_size = mem::size_of::<Header>();
+                    let ptr = self.ptr.as_ptr() as *mut u8;
+                    ptr.add(header_size + padding) as *mut T
+                }
+                else {
+                    NonNull::dangling().as_ptr()
+                }
             }
         }
     }
