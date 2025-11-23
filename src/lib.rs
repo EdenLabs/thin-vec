@@ -1863,7 +1863,7 @@ impl<T, A: Allocator> Extend<T> for ThinVec<T, A> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for ThinVec<T> {
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for ThinVec<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
