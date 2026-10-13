@@ -682,7 +682,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
     unsafe fn ptr(&self) -> *mut Header {
         debug_assert!(!Self::is_zst());
         if self.is_singleton() {
-            &EMPTY_HEADER as *const _ as *mut _
+            unsafe { &EMPTY_HEADER as *const _ as *mut _ }
         }
         else {
             self.ptr.as_ptr()
@@ -695,7 +695,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
     unsafe fn header(&self) -> &Header {
         debug_assert!(!Self::is_zst());
         if self.is_singleton() {
-            &EMPTY_HEADER
+            unsafe { &EMPTY_HEADER }
         }
         else {
             unsafe { self.ptr.as_ref() }
@@ -1054,7 +1054,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
             let ptr = self.data_raw();
             ptr::copy(ptr.add(idx), ptr.add(idx + 1), old_len - idx);
             ptr::write(ptr.add(idx), elem);
-            self.set_header_len(old_len + 1);
+            self.set_len_non_singleton(old_len + 1);
         }
     }
 
@@ -4290,6 +4290,16 @@ mod std_tests {
         let mut v: ThinVec<_> = (1..6).map(|x| x.to_string()).collect();
         for _ in v.drain(1..4).rev() {}
         assert_eq!(v, &[1.to_string(), 5.to_string()]);
+    }
+
+    #[cfg(not(feature = "gecko-ffi"))]
+    #[test]
+    fn test_insert_zst() {
+        let mut v: ThinVec<()> = ThinVec::new();
+        v.insert(0, ());
+        v.insert(1, ());
+        v.insert(0, ());
+        assert_eq!(v.len(), 3);
     }
 
     #[test]
