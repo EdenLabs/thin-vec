@@ -14,14 +14,14 @@
 //! * `ThinVec::new()` doesn't allocate (it points to a statically allocated singleton)
 //! * reallocation can be done in place
 //! * `size_of::<ThinVec<T>>()` == `size_of::<Option<ThinVec<T>>>()`
+//! * Doesn't allocate for Zero Sized Types (e.g. `ThinVec<()>`), but only without the "gecko-ffi" feature.
 //!
 //! Properties of `Vec` that aren't preserved:
 //! * `ThinVec<T>` can't ever be zero-cost roundtripped to a `Box<[T]>`, `String`, or `*mut T`
 //! * `from_raw_parts` doesn't exist
-//! * `ThinVec` currently doesn't bother to not-allocate for Zero Sized Types (e.g. `ThinVec<()>`),
-//!   but it could be done if someone cared enough to implement it.
 //!
 //!
+//! # Optional Features
 //!
 //! # Gecko FFI
 //!
@@ -145,6 +145,8 @@
 #![feature(iter_collect_into)]
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "unstable", feature(trusted_len))]
+#![cfg_attr(feature = "unstable", feature(dropck_eyepatch))]
 #![allow(clippy::comparison_chain, clippy::missing_safety_doc)]
 
 extern crate alloc;
@@ -154,24 +156,45 @@ use core::borrow::*;
 use core::cmp::*;
 use core::hash::*;
 use core::marker::PhantomData;
-use core::ops::Bound;
+use core::ops::{Bound, Index, IndexMut};
 use core::ops::{Deref, DerefMut, RangeBounds};
 use core::ptr::NonNull;
-use core::slice::IterMut;
-use core::{fmt, mem, ptr, slice};
+use core::slice::{Iter, SliceIndex};
+use core::{fmt, mem, ops, ptr, slice};
 
 use impl_details::*;
+
+#[cfg(feature = "malloc_size_of")]
+use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
 
 // modules: a simple way to cfg a whole bunch of impl details at once
 
 #[cfg(not(feature = "gecko-ffi"))]
 mod impl_details {
     pub type SizeType = usize;
-    pub const MAX_CAP: usize = !0;
+    // for ZSTs, store the length in the the NonNull<T> as a NonZero<usize>,
+    // the length is thus off by one and can only reach usize::MAX - 1
+    pub const MAX_CAP: usize = usize::MAX - 1;
 
     #[inline(always)]
     pub fn assert_size(x: usize) -> SizeType {
         x
+    }
+
+    #[inline(always)]
+    pub fn pack_capacity_and_auto(cap: SizeType, auto: bool) -> SizeType {
+        debug_assert!(!auto);
+        cap
+    }
+
+    #[inline(always)]
+    pub fn unpack_capacity(cap: SizeType) -> usize {
+        cap
+    }
+
+    #[inline(always)]
+    pub fn is_auto(_: SizeType) -> bool {
+        false
     }
 }
 
@@ -188,7 +211,7 @@ mod impl_details {
     // struct {
     //   uint32_t mLength;
     //   uint32_t mCapacity: 31;
-    //   uint32_t mIsAutoArray: 1;
+    //   uint32_t mIsAutoArray : 1;
     // }
     // ```
     //
@@ -202,24 +225,19 @@ mod impl_details {
     // our capacity u32. On big-endian platforms, it will be the low bit.
     // Hence we need some platform-specific CFGs for the necessary masking/shifting.
     //
-    // `ThinVec` won't ever construct an auto array. They only happen when
-    // bridging from C++. This means we don't need to ever set/preserve the bit.
-    // We just need to be able to read and handle it if it happens to be there.
-    //
     // Handling the auto bit mostly just means not freeing/reallocating the buffer.
 
     pub type SizeType = u32;
 
-    pub const MAX_CAP: usize = i32::max_value() as usize;
+    pub const MAX_CAP: usize = i32::MAX as usize;
+
+    // See kAutoTArrayHeaderOffset
+    pub const AUTO_ARRAY_HEADER_OFFSET: usize = 8;
 
     // Little endian: the auto bit is the high bit, and the capacity is
     // verbatim. So we just need to mask off the high bit. Note that
     // this masking is unnecessary when packing, because assert_size
     // guards against the high bit being set.
-    #[cfg(target_endian = "little")]
-    pub fn pack_capacity(cap: SizeType) -> SizeType {
-        cap as SizeType
-    }
     #[cfg(target_endian = "little")]
     pub fn unpack_capacity(cap: SizeType) -> usize {
         (cap as usize) & !(1 << 31)
@@ -228,14 +246,14 @@ mod impl_details {
     pub fn is_auto(cap: SizeType) -> bool {
         (cap & (1 << 31)) != 0
     }
+    #[cfg(target_endian = "little")]
+    pub fn pack_capacity_and_auto(cap: SizeType, auto: bool) -> SizeType {
+        cap | ((auto as SizeType) << 31)
+    }
 
     // Big endian: the auto bit is the low bit, and the capacity is
     // shifted up one bit. Masking out the auto bit is unnecessary,
     // as rust shifts always shift in 0's for unsigned integers.
-    #[cfg(target_endian = "big")]
-    pub fn pack_capacity(cap: SizeType) -> SizeType {
-        (cap as SizeType) << 1
-    }
     #[cfg(target_endian = "big")]
     pub fn unpack_capacity(cap: SizeType) -> usize {
         (cap >> 1) as usize
@@ -244,6 +262,10 @@ mod impl_details {
     pub fn is_auto(cap: SizeType) -> bool {
         (cap & 1) != 0
     }
+    #[cfg(target_endian = "big")]
+    pub fn pack_capacity_and_auto(cap: SizeType, auto: bool) -> SizeType {
+        (cap << 1) | (auto as SizeType)
+    }
 
     #[inline]
     pub fn assert_size(x: usize) -> SizeType {
@@ -251,6 +273,33 @@ mod impl_details {
             panic!("nsTArray size may not exceed the capacity of a 32-bit sized int");
         }
         x as SizeType
+    }
+}
+
+#[cold]
+fn capacity_overflow() -> ! {
+    panic!("capacity overflow")
+}
+
+trait UnwrapCapOverflow<T> {
+    fn unwrap_cap_overflow(self) -> T;
+}
+
+impl<T> UnwrapCapOverflow<T> for Option<T> {
+    fn unwrap_cap_overflow(self) -> T {
+        match self {
+            Some(val) => val,
+            None => capacity_overflow(),
+        }
+    }
+}
+
+impl<T, E> UnwrapCapOverflow<T> for Result<T, E> {
+    fn unwrap_cap_overflow(self) -> T {
+        match self {
+            Ok(val) => val,
+            Err(_) => capacity_overflow(),
+        }
     }
 }
 
@@ -287,41 +336,23 @@ impl Header {
     fn set_len(&mut self, len: usize) {
         self._len = assert_size(len);
     }
-}
 
-#[cfg(feature = "gecko-ffi")]
-impl Header {
     fn cap(&self) -> usize {
         unpack_capacity(self._cap)
     }
 
-    fn set_cap(&mut self, cap: usize) {
+    fn set_cap_and_auto(&mut self, cap: usize, is_auto: bool) {
         // debug check that our packing is working
-        debug_assert_eq!(unpack_capacity(pack_capacity(cap as SizeType)), cap);
-        // FIXME: this assert is busted because it reads uninit memory
-        // debug_assert!(!self.uses_stack_allocated_buffer());
-
-        // NOTE: this always stores a cleared auto bit, because set_cap
-        // is only invoked by Rust, and Rust doesn't create auto arrays.
-        self._cap = pack_capacity(assert_size(cap));
+        debug_assert_eq!(
+            unpack_capacity(pack_capacity_and_auto(cap as SizeType, is_auto)),
+            cap
+        );
+        self._cap = pack_capacity_and_auto(assert_size(cap), is_auto);
     }
 
-    fn uses_stack_allocated_buffer(&self) -> bool {
+    #[inline]
+    fn is_auto(&self) -> bool {
         is_auto(self._cap)
-    }
-}
-
-#[cfg(not(feature = "gecko-ffi"))]
-impl Header {
-    #[inline]
-    #[allow(clippy::unnecessary_cast)]
-    fn cap(&self) -> usize {
-        self._cap as usize
-    }
-
-    #[inline]
-    fn set_cap(&mut self, cap: usize) {
-        self._cap = assert_size(cap);
     }
 }
 
@@ -340,7 +371,7 @@ static EMPTY_HEADER : Header = Header { _len: 0, _cap: 0 };
 const EMPTY         : NonNull<Header> = NonNull::dangling();
 
 #[cfg(all(feature = "gecko-ffi", not(test), not(miri)))]
-extern "C" {
+unsafe extern "C" {
     #[link_name = "sEmptyTArrayHeader"]
     static EMPTY_HEADER: Header;
 }
@@ -365,57 +396,61 @@ fn alloc_size<T>(cap: usize) -> usize {
         // space for items, so we don't care about the capacity that was requested!
         0
     } else {
-        let cap: isize = cap.try_into().expect("capacity overflow");
+        let cap: isize = cap.try_into().unwrap_cap_overflow();
         let elem_size = mem::size_of::<T>() as isize;
-        elem_size.checked_mul(cap).expect("capacity overflow")
+        elem_size.checked_mul(cap).unwrap_cap_overflow()
     };
 
     let final_size = data_size
         .checked_add(header_size + padding)
-        .expect("capacity overflow");
+        .unwrap_cap_overflow();
 
     // Ok now we can turn it back into a usize (don't need to worry about negatives)
     final_size as usize
 }
 
 /// Gets the padding necessary for the array of a `ThinVec<T>`
-fn padding<T>() -> usize {
+const fn padding<T>() -> usize {
     let alloc_align = alloc_align::<T>();
     let header_size = mem::size_of::<Header>();
-
-    if alloc_align > header_size {
-        if cfg!(feature = "gecko-ffi") {
-            panic!(
-                "nsTArray does not handle alignment above > {} correctly",
-                header_size
-            );
-        }
-        alloc_align - header_size
-    } else {
-        0
+    if cfg!(feature = "gecko-ffi") {
+        assert!(
+            mem::size_of::<T>() != 0,
+            "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+        );
+        assert!(
+            header_size >= alloc_align,
+            "nsTArray does not handle alignment above the header size correctly",
+        );
     }
+    alloc_align.saturating_sub(header_size)
 }
 
 /// Gets the align necessary to allocate a `ThinVec<T>`
-fn alloc_align<T>() -> usize {
-    max(mem::align_of::<T>(), mem::align_of::<Header>())
+const fn alloc_align<T>() -> usize {
+    if mem::align_of::<T>() > mem::align_of::<Header>() {
+        return mem::align_of::<T>();
+    }
+    mem::align_of::<Header>()
 }
 
 /// Gets the layout necessary to allocate a `ThinVec<T>`
 ///
 /// # Panics
 ///
-/// Panics if the required size overflows `isize::MAX`.
+/// Panics if the required size overflows `isize::MAX` when rounded up to the required alignment.
 fn layout<T>(cap: usize) -> Layout {
-    unsafe { Layout::from_size_align_unchecked(alloc_size::<T>(cap), alloc_align::<T>()) }
+    Layout::from_size_align(alloc_size::<T>(cap), alloc_align::<T>())
+        .ok()
+        .unwrap_cap_overflow()
 }
 
 /// Allocates a header (and array) for a `ThinVec<T>` with the given capacity.
 ///
 /// # Panics
 ///
-/// Panics if the required size overflows `isize::MAX`.
-fn header_with_capacity<T, A: Allocator>(cap: usize, alloc: &A) -> NonNull<Header> {
+/// Panics if the required size overflows `isize::MAX` when rounded up to the required alignment.
+fn header_with_capacity<T, A: Allocator>(cap: usize, is_auto: bool, alloc: &A) -> NonNull<Header> {
     debug_assert!(cap > 0);
     unsafe {
         let layout = layout::<T>(cap);
@@ -428,16 +463,33 @@ fn header_with_capacity<T, A: Allocator>(cap: usize, alloc: &A) -> NonNull<Heade
             handle_alloc_error(layout)
         }
 
-        // "Infinite" capacity for zero-sized types:
-        (*header).set_cap(if mem::size_of::<T>() == 0 {
-            MAX_CAP
-        } else {
-            cap
-        });
-        (*header).set_len(0);
+        ptr::write(
+            header,
+            Header {
+                _len: 0,
+                _cap: if mem::size_of::<T>() == 0 {
+                    // "Infinite" capacity for zero-sized types:
+                    MAX_CAP as SizeType
+                } else {
+                    pack_capacity_and_auto(assert_size(cap), is_auto)
+                },
+            },
+        );
 
         NonNull::new_unchecked(header)
     }
+}
+
+/// # Safety
+///
+/// len must be != 0, this uses the `NonNull` to store a length, so the length must be stored offset by one.
+/// This function expect the len to be already shifted
+#[inline(always)]
+const unsafe fn len_to_ptr_unchecked<T: Sized>(len: usize) -> NonNull<T> {
+    use core::num::NonZeroUsize;
+    debug_assert!(len != 0);
+    // NonNull::without_provenance polyfill
+    unsafe { mem::transmute(NonZeroUsize::new_unchecked(len)) }
 }
 
 /// See the crate's top level documentation for a description of this type.
@@ -480,20 +532,20 @@ macro_rules! thin_vec {
     });
     () => {$crate::ThinVec::new()};
     ($($x:expr),*) => ({
-        let len = [$(thin_vec!(@UNIT $x)),*].len();
+        let len = [$($crate::thin_vec!(@UNIT $x)),*].len();
         let mut vec = $crate::ThinVec::with_capacity(len);
         $(vec.push($x);)*
         vec
     });
-    ($($x:expr,)*) => (thin_vec![$($x),*]);
+    ($($x:expr,)*) => ($crate::thin_vec![$($x),*]);
 }
 
 impl<T> ThinVec<T, Global> {
     /// Creates a new empty ThinVec.
     ///
     /// This will not allocate.
-    pub fn new() -> ThinVec<T> {
-        ThinVec::with_capacity_in(0, Global)
+    pub const fn new() -> ThinVec<T> {
+        ThinVec::new_in(Global)
     }
 
     /// Constructs a new, empty `ThinVec<T>` with at least the specified capacity.
@@ -508,10 +560,8 @@ impl<T> ThinVec<T, Global> {
     /// If it is important to know the exact allocated capacity of a `ThinVec`,
     /// always use the [`capacity`] method after construction.
     ///
-    /// **NOTE**: unlike `Vec`, `ThinVec` **MUST** allocate once to keep track of non-zero
-    /// lengths. As such, we cannot provide the same guarantees about ThinVecs
-    /// of ZSTs not allocating. However the allocation never needs to be resized
-    /// to add more ZSTs, since the underlying array is still length 0.
+    /// **NOTE**: like `Vec`, `ThinVec` doesn't allocate for ZSTs and stores the length inline,
+    /// but creating a `ThinVec` of ZSTs is not allowed if the "gecko-ffi" feature is enabled.
     ///
     /// [Capacity and reallocation]: #capacity-and-reallocation
     /// [`capacity`]: Vec::capacity
@@ -543,12 +593,12 @@ impl<T> ThinVec<T, Global> {
     /// assert_eq!(vec.len(), 11);
     /// assert!(vec.capacity() >= 11);
     ///
-    /// // A vector of a zero-sized type will always over-allocate, since no
-    /// // space is needed to store the actual elements.
+    /// # #[cfg(not(feature = "gecko-ffi"))] {
+    /// // A vector of a zero-sized type will not allocate and report to have max capacity.
+    /// // Note this is only true **without** the gecko-ffi feature!
     /// let vec_units = ThinVec::<()>::with_capacity(10);
-    ///
-    /// // Only true **without** the gecko-ffi feature!
-    /// // assert_eq!(vec_units.capacity(), usize::MAX);
+    /// assert_eq!(vec_units.capacity(), usize::MAX - 1);
+    /// # }
     /// ```
     pub fn with_capacity(cap: usize) -> ThinVec<T> {
         ThinVec::with_capacity_in(cap, Global)
@@ -556,113 +606,109 @@ impl<T> ThinVec<T, Global> {
 }
 
 impl<T, A: Allocator> ThinVec<T, A> {
-    /// Creates a new empty ThinVec.
-    ///
-    /// This will not allocate.
-    pub fn new_in(alloc: A) -> ThinVec<T, A> {
-        ThinVec::with_capacity_in(0, alloc)
+    /// Return true if we can use ZST optimizations
+    #[inline(always)]
+    const fn is_zst() -> bool {
+        size_of::<T>() == 0 && !cfg!(feature = "gecko-ffi")
     }
 
-    /// Constructs a new, empty `ThinVec<T>` with at least the specified capacity.
+    /// Creates a new empty ThinVec in the given allocator.
     ///
-    /// The vector will be able to hold at least `capacity` elements without
-    /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the vector will not allocate.
-    ///
-    /// It is important to note that although the returned vector has the
-    /// minimum *capacity* specified, the vector will have a zero *length*.
-    ///
-    /// If it is important to know the exact allocated capacity of a `ThinVec`,
-    /// always use the [`capacity`] method after construction.
-    ///
-    /// **NOTE**: unlike `Vec`, `ThinVec` **MUST** allocate once to keep track of non-zero
-    /// lengths. As such, we cannot provide the same guarantees about ThinVecs
-    /// of ZSTs not allocating. However the allocation never needs to be resized
-    /// to add more ZSTs, since the underlying array is still length 0.
-    ///
-    /// [Capacity and reallocation]: #capacity-and-reallocation
-    /// [`capacity`]: Vec::capacity
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new capacity exceeds `isize::MAX` bytes.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use thin_vec::ThinVec;
-    ///
-    /// let mut vec = ThinVec::with_capacity(10);
-    ///
-    /// // The vector contains no items, even though it has capacity for more
-    /// assert_eq!(vec.len(), 0);
-    /// assert!(vec.capacity() >= 10);
-    ///
-    /// // These are all done without reallocating...
-    /// for i in 0..10 {
-    ///     vec.push(i);
-    /// }
-    /// assert_eq!(vec.len(), 10);
-    /// assert!(vec.capacity() >= 10);
-    ///
-    /// // ...but this may make the vector reallocate
-    /// vec.push(11);
-    /// assert_eq!(vec.len(), 11);
-    /// assert!(vec.capacity() >= 11);
-    ///
-    /// // A vector of a zero-sized type will always over-allocate, since no
-    /// // space is needed to store the actual elements.
-    /// let vec_units = ThinVec::<()>::with_capacity(10);
-    ///
-    /// // Only true **without** the gecko-ffi feature!
-    /// // assert_eq!(vec_units.capacity(), usize::MAX);
-    /// ```
-    pub fn with_capacity_in(cap: usize, alloc: A) -> ThinVec<T, A> {
-        // `padding` contains ~static assertions against types that are
-        // incompatible with the current feature flags. We also call it to
-        // invoke these assertions when getting a pointer to the `ThinVec`
-        // contents, but since we also get a pointer to the contents in the
-        // `Drop` impl, trippng an assertion along that code path causes a
-        // double panic. We duplicate the assertion here so that it is
-        // testable,
+    /// This will not allocate.
+    pub const fn new_in(alloc: A) -> ThinVec<T, A> {
+        // See the comment in with_capacity_in().
         let _ = padding::<T>();
 
-        if cap == 0 {
-            ThinVec {
-                ptr     : EMPTY,
-                alloc   : alloc,
-                boo     : PhantomData,
+        if Self::is_zst() {
+            unsafe {
+                ThinVec {
+                    ptr     : len_to_ptr_unchecked(1),
+                    alloc   : alloc,
+                    boo     : PhantomData,
+                }
             }
         } else {
             ThinVec {
-                ptr     : header_with_capacity::<T, A>(cap, &alloc),
+                ptr     : EMPTY,
                 alloc   : alloc,
                 boo     : PhantomData,
             }
         }
     }
 
+    /// Constructs a new, empty `ThinVec<T, A>` with at least the specified capacity
+    /// in the given allocator.
+    ///
+    /// See [`ThinVec::with_capacity`] for the capacity and zero-sized type behaviour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity exceeds `isize::MAX` bytes.
+    pub fn with_capacity_in(cap: usize, alloc: A) -> ThinVec<T, A> {
+        // `padding` contains ~static assertions against types that are
+        // incompatible with the current feature flags. We also call it to
+        // invoke these assertions when getting a pointer to the `ThinVec`
+        // contents, but since we also get a pointer to the contents in the
+        // `Drop` impl, tripping an assertion along that code path causes a
+        // double panic. We duplicate the assertion here so that it is
+        // testable,
+        let _ = padding::<T>();
+
+        if Self::is_zst() {
+            unsafe {
+                return ThinVec {
+                    ptr     : len_to_ptr_unchecked(1),
+                    alloc   : alloc,
+                    boo     : PhantomData,
+                };
+            }
+        }
+
+        if cap == 0 {
+            return Self::new_in(alloc);
+        }
+        ThinVec {
+            ptr     : header_with_capacity::<T, A>(cap, false, &alloc),
+            alloc   : alloc,
+            boo     : PhantomData,
+        }
+    }
+
     // Accessor conveniences
 
-    fn ptr(&self) -> *mut Header {
+    /// # Safety
+    ///
+    /// must have Self::is_zst() == false
+    #[allow(unused_unsafe)]
+    unsafe fn ptr(&self) -> *mut Header {
+        debug_assert!(!Self::is_zst());
         if self.is_singleton() {
-            &EMPTY_HEADER as *const _ as *mut _
+            unsafe { &EMPTY_HEADER as *const _ as *mut _ }
         }
         else {
             self.ptr.as_ptr()
         }
     }
 
-    fn header(&self) -> &Header {
+    /// # Safety
+    ///
+    /// must have Self::is_zst() == false
+    #[allow(unused_unsafe)]
+    unsafe fn header(&self) -> &Header {
+        debug_assert!(!Self::is_zst());
         if self.is_singleton() {
-            &EMPTY_HEADER
+            unsafe { &EMPTY_HEADER }
         }
         else {
             unsafe { self.ptr.as_ref() }
         }
     }
-    
+
     fn data_raw(&self) -> *mut T {
+        if Self::is_zst() {
+            return ptr::dangling_mut();
+        }
+
         // `padding` contains ~static assertions against types that are
         // incompatible with the current feature flags. Even if we don't
         // care about its result, we should always call it before getting
@@ -697,7 +743,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
             if !empty_header_is_aligned && self.header().cap() == 0 {
                 NonNull::dangling().as_ptr()
             } else {
-                if self.has_allocation() {
+                if !self.is_singleton() {
                     // This could technically result in overflow, but padding
                     // would have to be absurdly large for this to occur.
                     let header_size = mem::size_of::<Header>();
@@ -711,9 +757,13 @@ impl<T, A: Allocator> ThinVec<T, A> {
         }
     }
 
-    // This is unsafe when the header is EMPTY_HEADER.
+    /// # Safety
+    ///
+    /// This is unsafe when the header is EMPTY_HEADER or when T is a ZST.
     unsafe fn header_mut(&mut self) -> &mut Header {
-        &mut *self.ptr()
+        debug_assert!(!self.is_singleton());
+        debug_assert!(!Self::is_zst());
+        unsafe { &mut *self.ptr() }
     }
 
     /// Returns the allocator of the vector.
@@ -733,7 +783,11 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// assert_eq!(a.len(), 3);
     /// ```
     pub fn len(&self) -> usize {
-        self.header().len()
+        if Self::is_zst() {
+            (self.ptr.as_ptr() as usize) - 1
+        } else {
+            unsafe { self.header().len() }
+        }
     }
 
     /// Returns `true` if the vector contains no elements.
@@ -765,7 +819,11 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// assert_eq!(vec.capacity(), 10);
     /// ```
     pub fn capacity(&self) -> usize {
-        self.header().cap()
+        if Self::is_zst() {
+            MAX_CAP
+        } else {
+            unsafe { self.header().cap() }
+        }
     }
 
     /// Returns `true` if the vector has the capacity to hold any element.
@@ -804,7 +862,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// # // don't use this as a starting point for a real library.
     /// # pub struct StreamWrapper { strm: *mut std::ffi::c_void }
     /// # const Z_OK: i32 = 0;
-    /// # extern "C" {
+    /// # unsafe extern "C" {
     /// #     fn deflateGetDictionary(
     /// #         strm: *mut std::ffi::c_void,
     /// #         dictionary: *mut u8,
@@ -860,13 +918,45 @@ impl<T, A: Allocator> ThinVec<T, A> {
             // less than or equal to capacity(). The same applies here.
             debug_assert!(len == 0, "invalid set_len({}) on empty ThinVec", len);
         } else {
-            self.header_mut().set_len(len)
+            unsafe { self.set_len_non_singleton(len) }
         }
     }
 
-    // For internal use only, when setting the length and it's known to be the non-singleton.
+    /// For internal use only, when setting the length and it's known that T is a ZST.
+    /// # Safety
+    /// - This is unsafe when T is not a ZST.
+    /// - len must be < usize::MAX
+    #[inline]
+    unsafe fn set_len_zst(&mut self, len: usize) {
+        debug_assert!(Self::is_zst());
+        debug_assert!(
+            len <= MAX_CAP,
+            "invalid set_len(usize::MAX) on ZST ThinVec (max cap is usize::MAX - 1)"
+        );
+        unsafe { self.ptr = len_to_ptr_unchecked(len + 1) }
+    }
+
+    /// For internal use only, when setting the length and it's known that the header is owned.
+    /// # Safety
+    /// This is unsafe when the header is EMPTY_HEADER or when T is a ZST.
+    #[inline]
+    unsafe fn set_header_len(&mut self, len: usize) {
+        unsafe { self.header_mut().set_len(len) }
+    }
+
+    /// For internal use only, when setting the length and it's known to be the non-singleton or T is a ZST.
+    /// # Safety
+    /// This is unsafe when the header is EMPTY_HEADER.
+    #[inline(always)]
     unsafe fn set_len_non_singleton(&mut self, len: usize) {
-        self.header_mut().set_len(len)
+        debug_assert!(!self.is_singleton());
+        if Self::is_zst() {
+            unsafe {
+                self.set_len_zst(len);
+            }
+        } else {
+            unsafe { self.set_header_len(len) }
+        }
     }
 
     /// Appends an element to the back of a collection.
@@ -890,7 +980,25 @@ impl<T, A: Allocator> ThinVec<T, A> {
             self.reserve(1);
         }
         unsafe {
+            // SAFETY: reserve() ensures sufficient capacity.
+            self.push_unchecked(val);
+        }
+    }
+
+    /// Appends an element to the back like `push`,
+    /// but assumes that sufficient capacity has already been reserved, i.e.
+    /// `len() < capacity()`.
+    ///
+    /// # Safety
+    ///
+    /// - Capacity must be reserved in advance such that `capacity() > len()`.
+    #[inline]
+    unsafe fn push_unchecked(&mut self, val: T) {
+        let old_len = self.len();
+        debug_assert!(old_len < self.capacity());
+        unsafe {
             ptr::write(self.data_raw().add(old_len), val);
+            // SAFETY: capacity > len >= 0, so capacity != 0, so this is not a singleton.
             self.set_len_non_singleton(old_len + 1);
         }
     }
@@ -1084,7 +1192,8 @@ impl<T, A: Allocator> ThinVec<T, A> {
                 // doesn't re-drop the just-failed value.
                 let new_len = self.len() - 1;
                 self.set_len_non_singleton(new_len);
-                ptr::drop_in_place(self.data_raw().add(new_len));
+                let ptr = self.data_raw().add(new_len);
+                ptr::drop_in_place(ptr);
             }
         }
     }
@@ -1105,8 +1214,18 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// ```
     pub fn clear(&mut self) {
         unsafe {
-            ptr::drop_in_place(&mut self[..]);
-            self.set_len(0); // could be the singleton
+            // Decrement len even in the case of a panic.
+            struct DropGuard<'a, T, A: Allocator>(&'a mut ThinVec<T, A>);
+            impl<T, A: Allocator> Drop for DropGuard<'_, T, A> {
+                fn drop(&mut self) {
+                    unsafe {
+                        // Could be the singleton.
+                        self.0.set_len(0);
+                    }
+                }
+            }
+            let guard = DropGuard(self);
+            ptr::drop_in_place(&mut guard.0[..]);
         }
     }
 
@@ -1153,18 +1272,18 @@ impl<T, A: Allocator> ThinVec<T, A> {
     pub fn reserve(&mut self, additional: usize) {
         let len = self.len();
         let old_cap = self.capacity();
-        let min_cap = len.checked_add(additional).expect("capacity overflow");
+        let min_cap = len.checked_add(additional).unwrap_cap_overflow();
         if min_cap <= old_cap {
             return;
+        }
+        // only way to get here is if min_cap == usize::MAX, which we can't handle.
+        if Self::is_zst() {
+            capacity_overflow();
         }
         // Ensure the new capacity is at least double, to guarantee exponential growth.
         let double_cap = if old_cap == 0 {
             // skip to 4 because tiny ThinVecs are dumb; but not if that would cause overflow
-            if mem::size_of::<T>() > (!0) / 8 {
-                1
-            } else {
-                4
-            }
+            if mem::size_of::<T>() > (!0) / 8 { 1 } else { 4 }
         } else {
             old_cap.saturating_mul(2)
         };
@@ -1184,11 +1303,10 @@ impl<T, A: Allocator> ThinVec<T, A> {
 
         let len = self.len();
         let old_cap = self.capacity();
-        let min_cap = len.checked_add(additional).expect("capacity overflow");
+        let min_cap = len.checked_add(additional).unwrap_cap_overflow();
         if min_cap <= old_cap {
             return;
         }
-
         // The growth logic can't handle zero-sized types, so we have to exit
         // early here.
         if elem_size == 0 {
@@ -1238,12 +1356,13 @@ impl<T, A: Allocator> ThinVec<T, A> {
     ///
     /// Re-allocates only if `self.capacity() < self.len() + additional`.
     pub fn reserve_exact(&mut self, additional: usize) {
-        let new_cap = self
-            .len()
-            .checked_add(additional)
-            .expect("capacity overflow");
+        let new_cap = self.len().checked_add(additional).unwrap_cap_overflow();
         let old_cap = self.capacity();
         if new_cap > old_cap {
+            // only way to get here is if new_cap == usize::MAX, which we can't handle.
+            if Self::is_zst() {
+                capacity_overflow()
+            }
             unsafe {
                 self.reallocate(new_cap);
             }
@@ -1267,34 +1386,40 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// assert!(vec.capacity() >= 3);
     /// ```
     pub fn shrink_to_fit(&mut self) {
+        if Self::is_zst() {
+            return;
+        }
         let old_cap = self.capacity();
         let new_cap = self.len();
-        if new_cap < old_cap {
-            if new_cap == 0 {
-                #[cold]
-                #[inline(never)]
-                fn drop_non_singleton<T, A: Allocator>(this: &mut ThinVec<T, A>) {
-                    unsafe {
-                        ptr::drop_in_place(&mut this[..]);
-
-                        #[cfg(feature = "gecko-ffi")]
-                        if this.ptr.as_ref().uses_stack_allocated_buffer() {
-                            return;
-                        }
-
-                        this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()))
-                    }
+        if new_cap >= old_cap {
+            return;
+        }
+        #[cfg(feature = "gecko-ffi")]
+        unsafe {
+            let stack_buf = self.auto_array_header_mut();
+            if !stack_buf.is_null() && (*stack_buf).cap() >= new_cap {
+                // Try to switch to our auto-buffer.
+                if stack_buf == self.ptr.as_ptr() {
+                    return;
                 }
-
-                if !self.is_singleton() {
-                    drop_non_singleton(self);
-                }
-
-                self.ptr = EMPTY;
-            } else {
-                unsafe {
-                    self.reallocate(new_cap);
-                }
+                stack_buf
+                    .add(1)
+                    .cast::<T>()
+                    .copy_from_nonoverlapping(self.data_raw(), new_cap);
+                self.alloc.deallocate(self.ptr.cast(), layout::<T>(old_cap));
+                self.ptr = NonNull::new_unchecked(stack_buf);
+                self.ptr.as_mut().set_len(new_cap);
+                return;
+            }
+        }
+        if new_cap == 0 {
+            if !self.is_singleton() {
+                drop_non_singleton(self);
+            }
+            self.ptr = EMPTY;
+        } else {
+            unsafe {
+                self.reallocate(new_cap);
             }
         }
     }
@@ -1563,12 +1688,11 @@ impl<T, A: Allocator> ThinVec<T, A> {
             // Set our length to the start bound
             self.set_len(start); // could be the singleton
 
-            let iter =
-                slice::from_raw_parts_mut(self.data_raw().add(start), end - start).iter_mut();
+            let iter = slice::from_raw_parts(self.data_raw().add(start), end - start).iter();
 
             Drain {
                 iter,
-                vec: self,
+                vec: NonNull::from(self),
                 end,
                 tail: len - end,
             }
@@ -1622,39 +1746,180 @@ impl<T, A: Allocator> ThinVec<T, A> {
         }
     }
 
-    /// Resize the buffer and update its capacity, without changing the length.
-    /// Unsafe because it can cause length to be greater than capacity.
-    unsafe fn reallocate(&mut self, new_cap: usize) {
-        debug_assert!(new_cap > 0);
-        if self.has_allocation() {
-            let old_cap = self.capacity();
-            let ptr     = {
-                let old_layout = layout::<T>(old_cap);
-                let new_layout = layout::<T>(new_cap);
+    /// Creates an iterator which uses a closure to determine if an element should be removed.
+    ///
+    /// If the closure returns true, then the element is removed and yielded.
+    /// If the closure returns false, the element will remain in the vector and will not be yielded
+    /// by the iterator.
+    ///
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use [`ThinVec::retain`] with a negated predicate if you do not need the returned iterator.
+    ///
+    /// Using this method is equivalent to the following code:
+    ///
+    /// ```
+    /// # use thin_vec::{ThinVec, thin_vec};
+    /// # let some_predicate = |x: &mut i32| { *x == 2 || *x == 3 || *x == 6 };
+    /// # let mut vec = thin_vec![1, 2, 3, 4, 5, 6];
+    /// let mut i = 0;
+    /// while i < vec.len() {
+    ///     if some_predicate(&mut vec[i]) {
+    ///         let val = vec.remove(i);
+    ///         // your code here
+    ///     } else {
+    ///         i += 1;
+    ///     }
+    /// }
+    ///
+    /// # assert_eq!(vec, thin_vec![1, 4, 5]);
+    /// ```
+    ///
+    /// But `extract_if` is easier to use. `extract_if` is also more efficient,
+    /// because it can backshift the elements of the array in bulk.
+    ///
+    /// Note that `extract_if` also lets you mutate every element in the filter closure,
+    /// regardless of whether you choose to keep or remove it.
+    ///
+    /// # Examples
+    ///
+    /// Splitting an array into evens and odds, reusing the original allocation:
+    ///
+    /// ```
+    /// use thin_vec::{ThinVec, thin_vec};
+    ///
+    /// let mut numbers = thin_vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15];
+    ///
+    /// let evens = numbers.extract_if(.., |x| *x % 2 == 0).collect::<ThinVec<_>>();
+    /// let odds = numbers;
+    ///
+    /// assert_eq!(evens, thin_vec![2, 4, 6, 8, 14]);
+    /// assert_eq!(odds, thin_vec![1, 3, 5, 9, 11, 13, 15]);
+    /// ```
+    pub fn extract_if<F, R: RangeBounds<usize>>(
+        &mut self,
+        range: R,
+        filter: F,
+    ) -> ExtractIf<'_, T, F, A>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        // Copy of https://github.com/rust-lang/rust/blob/ee361e8fca1c30e13e7a31cc82b64c045339d3a8/library/core/src/slice/index.rs#L37
+        fn slice_index_fail(start: usize, end: usize, len: usize) -> ! {
+            if start > len {
+                panic!(
+                    "range start index {} out of range for slice of length {}",
+                    start, len
+                )
+            }
 
-                // Growing the allocation.
-                if new_cap > old_cap {
-                    match self.alloc.grow(self.ptr.cast(), old_layout, new_layout) {
-                        Ok(x)   => x.as_ptr().cast::<Header>(),
-                        Err(_)  => ptr::null_mut()
-                    }
-                }
-                // Shrinking the allocation.
-                else {
-                    match self.alloc.shrink(self.ptr.cast(), old_layout, new_layout) {
-                        Ok(x)   => x.as_ptr().cast::<Header>(),
-                        Err(_)  => ptr::null_mut()
-                    }
-                }
+            if end > len {
+                panic!(
+                    "range end index {} out of range for slice of length {}",
+                    end, len
+                )
+            }
+
+            if start > end {
+                panic!("slice index starts at {} but ends at {}", start, end)
+            }
+
+            // Only reachable if the range was a `RangeInclusive` or a
+            // `RangeToInclusive`, with `end == len`.
+            panic!(
+                "range end index {} out of range for slice of length {}",
+                end, len
+            )
+        }
+
+        // Backport of https://github.com/rust-lang/rust/blob/ee361e8fca1c30e13e7a31cc82b64c045339d3a8/library/core/src/slice/index.rs#L855
+        pub fn slice_range<R>(range: R, bounds: ops::RangeTo<usize>) -> ops::Range<usize>
+        where
+            R: ops::RangeBounds<usize>,
+        {
+            let len = bounds.end;
+
+            let end = match range.end_bound() {
+                ops::Bound::Included(&end) if end >= len => slice_index_fail(0, end, len),
+                // Cannot overflow because `end < len` implies `end < usize::MAX`.
+                ops::Bound::Included(&end) => end + 1,
+
+                ops::Bound::Excluded(&end) if end > len => slice_index_fail(0, end, len),
+                ops::Bound::Excluded(&end) => end,
+                ops::Bound::Unbounded => len,
             };
 
-            if ptr.is_null() {
-                handle_alloc_error(layout::<T>(new_cap))
+            let start = match range.start_bound() {
+                ops::Bound::Excluded(&start) if start >= end => slice_index_fail(start, end, len),
+                // Cannot overflow because `start < end` implies `start < usize::MAX`.
+                ops::Bound::Excluded(&start) => start + 1,
+
+                ops::Bound::Included(&start) if start > end => slice_index_fail(start, end, len),
+                ops::Bound::Included(&start) => start,
+
+                ops::Bound::Unbounded => 0,
+            };
+
+            ops::Range { start, end }
+        }
+
+        let old_len = self.len();
+        let ops::Range { start, end } = slice_range(range, ..old_len);
+
+        // Guard against the vec getting leaked (leak amplification)
+        unsafe {
+            self.set_len(0);
+        }
+        ExtractIf {
+            vec: self,
+            idx: start,
+            del: 0,
+            end,
+            old_len,
+            pred: filter,
+        }
+    }
+
+    /// Resize the buffer and update its capacity, without changing the length.
+    /// Unsafe because it can cause length to be greater than capacity.
+    ///
+    /// # Safety
+    ///
+    /// Must not be called if Self::is_zst()
+    unsafe fn reallocate(&mut self, new_cap: usize) {
+        debug_assert!(new_cap > 0);
+        debug_assert!(!Self::is_zst());
+        if self.has_allocation() {
+            let old_cap = self.capacity();
+            unsafe {
+                let ptr = {
+                    let old_layout = layout::<T>(old_cap);
+                    let new_layout = layout::<T>(new_cap);
+
+                    // Growing the allocation.
+                    if new_cap > old_cap {
+                        match self.alloc.grow(self.ptr.cast(), old_layout, new_layout) {
+                            Ok(x)   => x.as_ptr().cast::<Header>(),
+                            Err(_)  => ptr::null_mut()
+                        }
+                    }
+                    // Shrinking the allocation.
+                    else {
+                        match self.alloc.shrink(self.ptr.cast(), old_layout, new_layout) {
+                            Ok(x)   => x.as_ptr().cast::<Header>(),
+                            Err(_)  => ptr::null_mut()
+                        }
+                    }
+                };
+
+                if ptr.is_null() {
+                    handle_alloc_error(layout::<T>(new_cap))
+                }
+                (*ptr).set_cap_and_auto(new_cap, (*ptr).is_auto());
+                self.ptr = NonNull::new_unchecked(ptr);
             }
-            (*ptr).set_cap(new_cap);
-            self.ptr = NonNull::new_unchecked(ptr);
         } else {
-            let new_header = header_with_capacity::<T, A>(new_cap, &self.alloc);
+            let mut new_header = header_with_capacity::<T, A>(new_cap, self.is_auto_array(), &self.alloc);
 
             // If we get here and have a non-zero len, then we must be handling
             // a gecko auto array, and we have items in a stack buffer. We shouldn't
@@ -1669,33 +1934,66 @@ impl<T, A: Allocator> ThinVec<T, A> {
             // by leaving behind a valid empty instance.
             let len = self.len();
             if cfg!(feature = "gecko-ffi") && len > 0 {
-                new_header
-                    .as_ptr()
-                    .add(1)
-                    .cast::<T>()
-                    .copy_from_nonoverlapping(self.data_raw(), len);
-                self.set_len_non_singleton(0);
+                unsafe {
+                    new_header
+                        .as_ptr()
+                        .add(1)
+                        .cast::<T>()
+                        .copy_from_nonoverlapping(self.data_raw(), len);
+                    self.set_header_len(0);
+                    new_header.as_mut().set_len(len);
+                }
             }
 
             self.ptr = new_header;
         }
     }
-    
+
     #[inline]
     fn is_singleton(&self) -> bool {
-        self.ptr == EMPTY
+        if Self::is_zst() {
+            false
+        } else {
+            self.ptr == EMPTY
+        }
     }
 
     #[cfg(feature = "gecko-ffi")]
     #[inline]
-    fn has_allocation(&self) -> bool {
-        unsafe { !self.is_singleton() && !self.ptr.as_ref().uses_stack_allocated_buffer() }
+    fn auto_array_header_mut(&mut self) -> *mut Header {
+        if !self.is_auto_array() {
+            return ptr::null_mut();
+        }
+        unsafe { (self as *mut Self).byte_add(AUTO_ARRAY_HEADER_OFFSET) as *mut Header }
     }
 
-    #[cfg(not(feature = "gecko-ffi"))]
+    #[cfg(feature = "gecko-ffi")]
+    #[inline]
+    fn auto_array_header(&self) -> *const Header {
+        if !self.is_auto_array() {
+            return ptr::null_mut();
+        }
+        unsafe { (self as *const Self).byte_add(AUTO_ARRAY_HEADER_OFFSET) as *const Header }
+    }
+
+    #[inline]
+    fn is_auto_array(&self) -> bool {
+        // The singleton's `ptr` is a sentinel and a ZST's `ptr` encodes its length, so
+        // neither points at a header.
+        !Self::is_zst() && unsafe { self.header().is_auto() }
+    }
+
+    #[inline]
+    fn uses_stack_allocated_buffer(&self) -> bool {
+        #[cfg(feature = "gecko-ffi")]
+        return self.auto_array_header() == self.ptr.as_ptr();
+        #[cfg(not(feature = "gecko-ffi"))]
+        return false;
+    }
+
     #[inline]
     fn has_allocation(&self) -> bool {
-        !self.is_singleton()
+        !Self::is_zst() && !self.is_singleton() && !self.uses_stack_allocated_buffer()
     }
 }
 
@@ -1790,26 +2088,51 @@ impl<T: PartialEq, A: Allocator> ThinVec<T, A> {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn drop_non_singleton<T, A: Allocator>(this: &mut ThinVec<T, A>) {
+    unsafe {
+        ptr::drop_in_place(&mut this[..]);
+
+        if this.uses_stack_allocated_buffer() {
+            return;
+        }
+
+        this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()));
+    }
+}
+
+/// # Safety
+///
+/// This function drop and deallocates the inner values of the `ThinVec`,
+/// invariants are therefore broken and the value must be considered dropped and should not be accessed again.
+#[inline]
+unsafe fn drop_thin_vec<T, A: Allocator>(this: &mut ThinVec<T, A>) {
+    if ThinVec::<T, A>::is_zst() {
+        unsafe {
+            ptr::drop_in_place(&mut this[..]);
+        }
+    } else if !this.is_singleton() {
+        drop_non_singleton(this);
+    }
+}
+
+#[cfg(not(feature = "unstable"))]
 impl<T, A: Allocator> Drop for ThinVec<T, A> {
     #[inline]
     fn drop(&mut self) {
-        #[cold]
-        #[inline(never)]
-        fn drop_non_singleton<T, A: Allocator>(this: &mut ThinVec<T, A>) {
-            unsafe {
-                ptr::drop_in_place(&mut this[..]);
-
-                #[cfg(feature = "gecko-ffi")]
-                if this.ptr.as_ref().uses_stack_allocated_buffer() {
-                    return;
-                }
-
-                this.alloc.deallocate(this.ptr.cast(), layout::<T>(this.capacity()));
-            }
+        unsafe {
+            drop_thin_vec(self);
         }
+    }
+}
 
-        if !self.is_singleton() {
-            drop_non_singleton(self);
+#[cfg(feature = "unstable")]
+unsafe impl<#[may_dangle] T, A: Allocator> Drop for ThinVec<T, A> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            drop_thin_vec(self);
         }
     }
 }
@@ -1825,6 +2148,20 @@ impl<T, A: Allocator> Deref for ThinVec<T, A> {
 impl<T, A: Allocator> DerefMut for ThinVec<T, A> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
+    }
+}
+
+impl<T, I: SliceIndex<[T]>, A: Allocator> Index<I> for ThinVec<T, A> {
+    type Output = <I as SliceIndex<[T]>>::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.deref()[index]
+    }
+}
+
+impl<T, I: SliceIndex<[T]>, A: Allocator> IndexMut<I> for ThinVec<T, A> {
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        &mut self.deref_mut()[index]
     }
 }
 
@@ -1852,11 +2189,21 @@ impl<T, A: Allocator> Extend<T> for ThinVec<T, A> {
     where
         I: IntoIterator<Item = T>,
     {
-        let iter = iter.into_iter();
+        let mut iter = iter.into_iter();
         let hint = iter.size_hint().0;
         if hint > 0 {
             self.reserve(hint);
+            for x in iter.by_ref().take(hint) {
+                // SAFETY: `reserve(hint)` ensures the next `hint` calls of `push_unchecked`
+                // have sufficient capacity.
+                unsafe {
+                    self.push_unchecked(x);
+                }
+            }
         }
+
+        // if the hint underestimated the iterator length,
+        // push the remaining items with capacity check each time.
         for x in iter {
             self.push(x);
         }
@@ -1938,6 +2285,80 @@ where
     #[inline]
     fn eq(&self, other: &&'a [B]) -> bool {
         self[..] == other[..]
+    }
+}
+
+// Serde impls based on
+// https://github.com/bluss/arrayvec/blob/67ec907a98c0f40c4b76066fed3c1af59d35cf6a/src/arrayvec.rs#L1222-L1267
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize> serde::Serialize for ThinVec<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(self.as_slice())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ThinVec<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::Deserialize;
+        use serde::de::{SeqAccess, Visitor};
+
+        struct ThinVecVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for ThinVecVisitor<T> {
+            type Value = ThinVec<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "a sequence")
+            }
+
+            fn visit_seq<SA>(self, mut seq: SA) -> Result<Self::Value, SA::Error>
+            where
+                SA: SeqAccess<'de>,
+            {
+                // Same policy as
+                // https://github.com/serde-rs/serde/blob/ce0844b9ecc32377b5e4545d759d385a8c46bc6a/serde/src/private/size_hint.rs#L13
+                let initial_capacity = seq.size_hint().unwrap_or_default().min(4096);
+                let mut values = ThinVec::<T>::with_capacity(initial_capacity);
+
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+
+                Ok(values)
+            }
+        }
+
+        deserializer.deserialize_seq(ThinVecVisitor::<T>(PhantomData))
+    }
+}
+
+#[cfg(feature = "malloc_size_of")]
+impl<T> MallocShallowSizeOf for ThinVec<T> {
+    fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        if !self.has_allocation() {
+            // We're not a heap pointer.
+            return 0;
+        }
+
+        unsafe { ops.malloc_size_of(self.ptr() as _) }
+    }
+}
+
+#[cfg(feature = "malloc_size_of")]
+impl<T: MallocSizeOf> MallocSizeOf for ThinVec<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let mut n = self.shallow_size_of(ops);
+        for elem in self.iter() {
+            n += elem.size_of(ops);
+        }
+        n
     }
 }
 
@@ -2038,7 +2459,8 @@ impl<T> Default for ThinVec<T> {
 impl<T> FromIterator<T> for ThinVec<T> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> ThinVec<T> {
-        let mut vec = ThinVec::new();
+        let iter = iter.into_iter();
+        let mut vec = ThinVec::with_capacity(iter.size_hint().0);
         vec.extend(iter);
         vec
     }
@@ -2339,10 +2761,18 @@ impl<T, A: Allocator> Drop for IntoIter<T, A> {
         #[cold]
         #[inline(never)]
         fn drop_non_singleton<T, A: Allocator>(this: &mut IntoIter<T, A>) {
+            // Leak on panic.
+            struct DropGuard<'a, T, A: Allocator>(&'a mut IntoIter<T, A>);
+            impl<T, A: Allocator> Drop for DropGuard<'_, T, A> {
+                fn drop(&mut self) {
+                    unsafe {
+                        self.0.vec.set_len_non_singleton(0);
+                    }
+                }
+            }
             unsafe {
-                let entries = std::ptr::addr_of_mut!(this.vec[this.start..]);
-                this.vec.set_len_non_singleton(0);
-                ptr::drop_in_place(entries);
+                let guard = DropGuard(this);
+                ptr::drop_in_place(&mut guard.0.vec[guard.0.start..]);
             }
         }
 
@@ -2455,20 +2885,17 @@ pub struct Drain<'a, T, A: Allocator=Global> {
     // and setting `len` to `len + tail_len` to undo the leak amplification.
     /// An iterator over the elements we're removing.
     ///
-    /// As we go we'll be `read`ing out of the mutable refs yielded by this.
-    /// It's ok to use IterMut here because it promises to only take mutable
-    /// refs to the parts we haven't yielded yet.
-    ///
-    /// A downside of this (and the *mut below) is that it makes this type invariant, when
-    /// technically it could be covariant?
-    iter: IterMut<'a, T>,
+    /// As we go we'll be `read`ing out of the shared refs yielded by this.
+    /// It's ok to use Iter here because it promises to only take refs to the parts
+    /// we haven't yielded yet.
+    iter: Iter<'a, T>,
     /// The actual ThinVec, which we need to hold onto to undo the leak amplification
     /// and backshift the tail into place. This should only be accessed when we're
-    /// completely done with the IterMut in the `drop` impl of this type (or miri will get mad).
+    /// completely done with the Iter in the `drop` impl of this type (or miri will get mad).
     ///
-    /// Since we set the `len` of this to be before `IterMut`, we can use that `len`
+    /// Since we set the `len` of this to be before `Iter`, we can use that `len`
     /// to retrieve the index of the start of the drain range later.
-    vec: *mut ThinVec<T, A>,
+    vec: NonNull<ThinVec<T, A>>,
     /// The one-past-the-end index of the drain range, or equivalently the start of the tail.
     end: usize,
     /// The length of the tail.
@@ -2507,7 +2934,7 @@ impl<'a, T, A: Allocator> Drop for Drain<'a, T, A> {
 
         // Move the tail over the drained items, and update the length.
         unsafe {
-            let vec = &mut *self.vec;
+            let vec = self.vec.as_mut();
 
             // Don't mutate the empty singleton!
             if !vec.is_singleton() {
@@ -2604,7 +3031,7 @@ impl<I: Iterator, A: Allocator> Drop for Splice<'_, I, A> {
             // If there's no tail elements, then the inner ThinVec is already
             // correct and we can just extend it like normal.
             if self.drain.tail == 0 {
-                (*self.drain.vec).extend(self.replace_with.by_ref());
+                self.drain.vec.as_mut().extend(self.replace_with.by_ref());
                 return;
             }
 
@@ -2641,6 +3068,100 @@ impl<I: Iterator, A: Allocator> Drop for Splice<'_, I, A> {
     }
 }
 
+#[cfg(feature = "gecko-ffi")]
+#[repr(C, align(8))]
+struct AutoBuffer<T, const N: usize> {
+    header: Header,
+    buffer: mem::MaybeUninit<[T; N]>,
+}
+
+#[doc(hidden)]
+#[cfg(feature = "gecko-ffi")]
+#[repr(C)]
+pub struct AutoThinVec<T, const N: usize> {
+    inner: ThinVec<T>,
+    buffer: AutoBuffer<T, N>,
+    _pinned: core::marker::PhantomPinned,
+}
+
+#[cfg(feature = "gecko-ffi")]
+impl<T, const N: usize> AutoThinVec<T, N> {
+    /// Implementation detail for the auto_thin_vec macro.
+    #[inline]
+    #[doc(hidden)]
+    pub fn new_unpinned() -> Self {
+        // This condition is hard-coded in nsTArray.h
+        assert!(
+            core::mem::align_of::<T>() <= 8,
+            "Can't handle alignments greater than 8"
+        );
+        assert_eq!(
+            core::mem::offset_of!(Self, buffer),
+            AUTO_ARRAY_HEADER_OFFSET
+        );
+        Self {
+            inner: ThinVec::new(),
+            buffer: AutoBuffer {
+                header: Header {
+                    _len: 0,
+                    _cap: pack_capacity_and_auto(N as SizeType, true),
+                },
+                buffer: mem::MaybeUninit::uninit(),
+            },
+            _pinned: core::marker::PhantomPinned,
+        }
+    }
+
+    /// Returns a raw pointer to the inner ThinVec. Note that if you dereference it from rust, you
+    /// need to make sure not to move the ThinVec manually via something like
+    /// `std::mem::take(&mut auto_vec)`.
+    pub fn as_mut_ptr(self: core::pin::Pin<&mut Self>) -> *mut ThinVec<T> {
+        debug_assert!(self.is_auto_array());
+        unsafe { &mut self.get_unchecked_mut().inner }
+    }
+
+    #[inline]
+    pub unsafe fn shrink_to_fit_known_singleton(self: core::pin::Pin<&mut Self>) {
+        debug_assert!(self.is_singleton());
+        let this = unsafe { self.get_unchecked_mut() };
+        this.buffer.header.set_len(0);
+        // TODO(emilio): Use NonNull::from_mut when msrv allows.
+        this.inner.ptr = unsafe { NonNull::new_unchecked(&mut this.buffer.header) };
+        debug_assert!(this.inner.is_auto_array());
+        debug_assert!(this.inner.uses_stack_allocated_buffer());
+    }
+
+    pub fn shrink_to_fit(self: core::pin::Pin<&mut Self>) {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.inner.shrink_to_fit();
+        debug_assert!(this.inner.is_auto_array());
+    }
+}
+
+// NOTE(emilio): DerefMut wouldn't be safe, see the comment in as_mut_ptr.
+#[cfg(feature = "gecko-ffi")]
+impl<T, const N: usize> Deref for AutoThinVec<T, N> {
+    type Target = ThinVec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Create a ThinVec<$ty> named `$name`, with capacity for `$cap` inline elements.
+///
+/// TODO(emilio): This would be a lot more convenient to use with super let, see
+/// <https://github.com/rust-lang/rust/issues/139076>
+#[cfg(feature = "gecko-ffi")]
+#[macro_export]
+macro_rules! auto_thin_vec {
+    (let $name:ident : [$ty:ty; $cap:literal]) => {
+        let auto_vec = $crate::AutoThinVec::<$ty, $cap>::new_unpinned();
+        let mut $name = core::pin::pin!(auto_vec);
+        unsafe { $name.as_mut().shrink_to_fit_known_singleton() };
+    };
+}
+
 /// Private helper methods for `Splice::drop`
 impl<T, A: Allocator> Drain<'_, T, A> {
     /// The range from `self.vec.len` to `self.tail_start` contains elements
@@ -2648,7 +3169,7 @@ impl<T, A: Allocator> Drain<'_, T, A> {
     /// Fill that range as much as possible with new elements from the `replace_with` iterator.
     /// Returns `true` if we filled the entire range. (`replace_with.next()` didn’t return `None`.)
     unsafe fn fill<I: Iterator<Item = T>>(&mut self, replace_with: &mut I) -> bool {
-        let vec = unsafe { &mut *self.vec };
+        let vec = unsafe { self.vec.as_mut() };
         let range_start = vec.len();
         let range_end = self.end;
         let range_slice = unsafe {
@@ -2656,11 +3177,12 @@ impl<T, A: Allocator> Drain<'_, T, A> {
         };
 
         for place in range_slice {
-            if let Some(new_item) = replace_with.next() {
-                unsafe { ptr::write(place, new_item) };
-                vec.set_len(vec.len() + 1);
-            } else {
+            let Some(new_item) = replace_with.next() else {
                 return false;
+            };
+            unsafe {
+                ptr::write(place, new_item);
+                vec.set_len(vec.len() + 1);
             }
         }
         true
@@ -2668,9 +3190,9 @@ impl<T, A: Allocator> Drain<'_, T, A> {
 
     /// Makes room for inserting more elements before the tail.
     unsafe fn move_tail(&mut self, additional: usize) {
-        let vec = unsafe { &mut *self.vec };
+        let vec = unsafe { self.vec.as_mut() };
         let len = self.end + self.tail;
-        vec.reserve(len.checked_add(additional).expect("capacity overflow"));
+        vec.reserve(len.checked_add(additional).unwrap_cap_overflow());
 
         let new_tail_start = self.end + additional;
         unsafe {
@@ -2679,6 +3201,79 @@ impl<T, A: Allocator> Drain<'_, T, A> {
             ptr::copy(src, dst, self.tail);
         }
         self.end = new_tail_start;
+    }
+}
+
+/// An iterator for [`ThinVec`] which uses a closure to determine if an element should be removed.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct ExtractIf<'a, T, F, A: Allocator = Global> {
+    vec: &'a mut ThinVec<T, A>,
+    /// The index of the item that will be inspected by the next call to `next`.
+    idx: usize,
+    /// Elements at and beyond this point will be retained. Must be equal or smaller than `old_len`.
+    end: usize,
+    /// The number of items that have been drained (removed) thus far.
+    del: usize,
+    /// The original length of `vec` prior to draining.
+    old_len: usize,
+    /// The filter test predicate.
+    pred: F,
+}
+
+impl<T, F, A: Allocator> Iterator for ExtractIf<'_, T, F, A>
+where
+    F: FnMut(&mut T) -> bool,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        unsafe {
+            let v = self.vec.data_raw();
+            while self.idx < self.end {
+                let i = self.idx;
+                let drained = (self.pred)(&mut *v.add(i));
+                // Update the index *after* the predicate is called. If the index
+                // is updated prior and the predicate panics, the element at this
+                // index would be leaked.
+                self.idx += 1;
+                if drained {
+                    self.del += 1;
+                    return Some(ptr::read(v.add(i)));
+                } else if self.del > 0 {
+                    let del = self.del;
+                    let src: *const T = v.add(i);
+                    let dst: *mut T = v.add(i - del);
+                    ptr::copy_nonoverlapping(src, dst, 1);
+                }
+            }
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.end - self.idx))
+    }
+}
+
+impl<T, F, A: Allocator> Drop for ExtractIf<'_, T, F, A> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.idx < self.old_len && self.del > 0 {
+                // This is a pretty messed up state, and there isn't really an
+                // obviously right thing to do. We don't want to keep trying
+                // to execute `pred`, so we just backshift all the unprocessed
+                // elements and tell the vec that they still exist. The backshift
+                // is required to prevent a double-drop of the last successfully
+                // drained item prior to a panic in the predicate.
+                let ptr = self.vec.data_raw();
+                let src = ptr.add(self.idx);
+                let dst = src.sub(self.del);
+                let tail_len = self.old_len - self.idx;
+                src.copy_to(dst, tail_len);
+            }
+
+            self.vec.set_len(self.old_len - self.del);
+        }
     }
 }
 
@@ -2709,8 +3304,8 @@ impl<A: Allocator> std::io::Write for ThinVec<u8, A> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThinVec, MAX_CAP};
-    use crate::alloc::vec;
+    use super::{MAX_CAP, ThinVec};
+    use crate::alloc::{string::ToString, vec};
 
     #[test]
     fn test_size_of() {
@@ -2726,22 +3321,32 @@ mod tests {
     }
 
     #[test]
-    fn test_data_ptr_alignment() {
-        let v = ThinVec::<u16>::new();
-        assert!(v.data_raw() as usize % 2 == 0);
-
-        let v = ThinVec::<u32>::new();
-        assert!(v.data_raw() as usize % 4 == 0);
-
-        let v = ThinVec::<u64>::new();
-        assert!(v.data_raw() as usize % 8 == 0);
+    #[should_panic]
+    fn test_cap_plus_header_rounded_up_overflows() {
+        let _ = ThinVec::<u8>::with_capacity(isize::MAX as usize - size_of::<super::Header>());
     }
 
     #[test]
-    #[cfg_attr(feature = "gecko-ffi", should_panic)]
+    fn test_data_ptr_alignment() {
+        let v = ThinVec::<u16>::new();
+        assert!(v.data_raw() as usize % core::mem::align_of::<u16>() == 0);
+
+        let v = ThinVec::<u32>::new();
+        assert!(v.data_raw() as usize % core::mem::align_of::<u32>() == 0);
+
+        let v = ThinVec::<u64>::new();
+        assert!(v.data_raw() as usize % core::mem::align_of::<u64>() == 0);
+    }
+
+    #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "nsTArray does not handle alignment above the header size correctly"
+    )]
     fn test_overaligned_type_is_rejected_for_gecko_ffi_mode() {
         #[allow(dead_code)]
         #[repr(align(16))]
+        #[allow(unused)]
         struct Align16(u8);
 
         let v = ThinVec::<Align16>::new();
@@ -2796,6 +3401,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn test_drain_items_zero_sized() {
         let mut vec = thin_vec![(), (), ()];
         let mut vec2 = thin_vec![];
@@ -2826,13 +3435,24 @@ mod tests {
         let mut v: ThinVec<_> = (1..6).map(|x| x.to_string()).collect();
         for _ in v.drain(1..4).rev() {}
         assert_eq!(v, &[1.to_string(), 5.to_string()]);
+    }
 
+    #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
+    fn test_drain_range_zst() {
         let mut v: ThinVec<_> = thin_vec![(); 5];
         for _ in v.drain(1..4).rev() {}
         assert_eq!(v, &[(), ()]);
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn test_drain_max_vec_size() {
         let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
         unsafe {
@@ -3074,6 +3694,15 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_capacity() {
+        for i in 0..20 {
+            let v = (0..i).into_iter().collect::<ThinVec<usize>>();
+            assert_eq!(v.len(), i);
+            assert_eq!(v.capacity(), i);
+        }
+    }
+
+    #[test]
     fn test_clone() {
         let mut v = ThinVec::<i32>::new();
         assert!(v.is_singleton());
@@ -3093,7 +3722,6 @@ mod std_tests {
     use super::*;
     use crate::alloc::format;
     use core::mem::size_of;
-    use core::usize;
 
     struct DropCounter<'a> {
         count: &'a mut u32,
@@ -3188,16 +3816,6 @@ mod std_tests {
         v.extend(w.clone()); // specializes to `append`
         assert!(v.iter().eq(w.iter().chain(w.iter())));
 
-        // Zero sized types
-        #[derive(PartialEq, Debug)]
-        struct Foo;
-
-        let mut a = ThinVec::new();
-        let b = thin_vec![Foo, Foo];
-
-        a.extend(b);
-        assert_eq!(a, &[Foo, Foo]);
-
         // Double drop
         let mut count_x = 0;
         {
@@ -3209,6 +3827,22 @@ mod std_tests {
         }
 
         assert_eq!(count_x, 1);
+    }
+
+    #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
+    fn test_extend_zst() {
+        #[derive(PartialEq, Debug)]
+        struct Foo;
+
+        let mut a = ThinVec::new();
+        let b = thin_vec![Foo, Foo];
+
+        a.extend(b);
+        assert_eq!(a, &[Foo, Foo]);
     }
 
     /* TODO: implement extend for Iter<&Copy>
@@ -3400,6 +4034,10 @@ mod std_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn zero_sized_values() {
         let mut v = ThinVec::new();
         assert_eq!(v.len(), 0);
@@ -3466,7 +4104,7 @@ mod std_tests {
     #[test]
     fn test_vec_truncate_drop() {
         static mut DROPS: u32 = 0;
-        #[allow(dead_code)]
+        #[allow(unused)]
         struct Elem(i32);
         impl Drop for Elem {
             fn drop(&mut self) {
@@ -3505,6 +4143,13 @@ mod std_tests {
     fn test_index() {
         let vec = thin_vec![1, 2, 3];
         assert!(vec[1] == 2);
+    }
+
+    #[test]
+    fn test_index_mut() {
+        let mut vec = thin_vec![1, 2, 3];
+        vec[1] = 22;
+        assert!(vec[1] == 22);
     }
 
     #[test]
@@ -3577,6 +4222,10 @@ mod std_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn test_move_items_zero_sized() {
         let vec = thin_vec![(), (), ()];
         let mut vec2 = thin_vec![];
@@ -3609,6 +4258,10 @@ mod std_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn test_drain_items_zero_sized() {
         let mut vec = thin_vec![(), (), ()];
         let mut vec2 = thin_vec![];
@@ -3639,7 +4292,24 @@ mod std_tests {
         let mut v: ThinVec<_> = (1..6).map(|x| x.to_string()).collect();
         for _ in v.drain(1..4).rev() {}
         assert_eq!(v, &[1.to_string(), 5.to_string()]);
+    }
 
+    #[cfg(not(feature = "gecko-ffi"))]
+    #[test]
+    fn test_insert_zst() {
+        let mut v: ThinVec<()> = ThinVec::new();
+        v.insert(0, ());
+        v.insert(1, ());
+        v.insert(0, ());
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
+    fn test_drain_range_zst() {
         let mut v: ThinVec<_> = thin_vec![(); 5];
         for _ in v.drain(1..4).rev() {}
         assert_eq!(v, &[(), ()]);
@@ -3671,19 +4341,19 @@ mod std_tests {
     #[test]
     #[cfg(not(feature = "gecko-ffi"))]
     fn test_drain_max_vec_size() {
-        let mut v = ThinVec::<()>::with_capacity(usize::max_value());
+        let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
         unsafe {
-            v.set_len(usize::max_value());
+            v.set_len(MAX_CAP);
         }
-        for _ in v.drain(usize::max_value() - 1..) {}
-        assert_eq!(v.len(), usize::max_value() - 1);
+        for _ in v.drain(MAX_CAP - 1..) {}
+        assert_eq!(v.len(), MAX_CAP - 1);
 
-        let mut v = ThinVec::<()>::with_capacity(usize::max_value());
+        let mut v = ThinVec::<()>::with_capacity(MAX_CAP);
         unsafe {
-            v.set_len(usize::max_value());
+            v.set_len(MAX_CAP);
         }
-        for _ in v.drain(usize::max_value() - 1..=usize::max_value() - 1) {}
-        assert_eq!(v.len(), usize::max_value() - 1);
+        for _ in v.drain(MAX_CAP - 1..=MAX_CAP - 1) {}
+        assert_eq!(v.len(), MAX_CAP - 1);
     }
 
     #[test]
@@ -3732,6 +4402,10 @@ mod std_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gecko-ffi",
+        should_panic = "ThinVec<T> cannot bridge to nsTArray<T> when T is zero-sized"
+    )]
     fn test_splice_items_zero_sized() {
         let mut vec = thin_vec![(), (), ()];
         let vec2 = thin_vec![];
@@ -3844,17 +4518,15 @@ mod std_tests {
         assert_eq!(it.next(), None);
     }
 
-    /* TODO: make drain covariant
-        #[allow(dead_code)]
-        fn assert_covariance() {
-            fn drain<'new>(d: Drain<'static, &'static str>) -> Drain<'new, &'new str> {
-                d
-            }
-            fn into_iter<'new>(i: IntoIter<&'static str>) -> IntoIter<&'new str> {
-                i
-            }
+    #[allow(dead_code)]
+    fn assert_covariance() {
+        fn drain<'new>(d: Drain<'static, &'static str>) -> Drain<'new, &'new str> {
+            d
         }
-    */
+        fn into_iter<'new>(i: IntoIter<&'static str>) -> IntoIter<&'new str> {
+            i
+        }
+    }
 
     /* TODO: specialize vec.into_iter().collect::<ThinVec<_>>();
         #[test]
@@ -4263,6 +4935,45 @@ mod std_tests {
         }
     */
 
+    #[cfg(feature = "gecko-ffi")]
+    #[test]
+    fn auto_t_array_basic() {
+        crate::auto_thin_vec!(let t: [u8; 10]);
+        assert_eq!(t.capacity(), 10);
+        assert!(t.is_auto_array());
+        assert!(t.uses_stack_allocated_buffer());
+        assert!(!t.has_allocation());
+        assert_eq!(t.len(), 0);
+        {
+            let inner = unsafe { &mut *t.as_mut().as_mut_ptr() };
+            for i in 0..30 {
+                inner.push(i as u8);
+            }
+        }
+
+        assert!(t.is_auto_array());
+        assert!(!t.uses_stack_allocated_buffer());
+        assert_eq!(t.len(), 30);
+        assert!(t.has_allocation());
+        assert_eq!(t[5], 5);
+        assert_eq!(t[29], 29);
+        assert!(t.capacity() >= 30);
+
+        {
+            let inner = unsafe { &mut *t.as_mut().as_mut_ptr() };
+            inner.truncate(5);
+        }
+
+        assert_eq!(t.len(), 5);
+        assert!(t.capacity() >= 30);
+        assert!(t.has_allocation());
+        t.as_mut().shrink_to_fit();
+        assert!(!t.has_allocation());
+        assert!(t.is_auto_array());
+        assert!(t.uses_stack_allocated_buffer());
+        assert_eq!(t.capacity(), 10);
+    }
+
     #[test]
     #[cfg_attr(feature = "gecko-ffi", ignore)]
     fn test_header_data() {
@@ -4295,6 +5006,37 @@ mod std_tests {
 
         assert_eq!(padding::<Funky<[*mut usize; 1024]>>(), 128 - HEADER_SIZE);
         assert_aligned_head_ptr!(Funky<[*mut usize; 1024]>);
+    }
+
+    #[cfg(feature = "serde")]
+    use serde_test::{Token, assert_tokens};
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_ser_de_empty() {
+        let vec = ThinVec::<u32>::new();
+
+        assert_tokens(&vec, &[Token::Seq { len: Some(0) }, Token::SeqEnd]);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_ser_de() {
+        let mut vec = ThinVec::<u32>::new();
+        vec.push(20);
+        vec.push(55);
+        vec.push(123);
+
+        assert_tokens(
+            &vec,
+            &[
+                Token::Seq { len: Some(3) },
+                Token::U32(20),
+                Token::U32(55),
+                Token::U32(123),
+                Token::SeqEnd,
+            ],
+        );
     }
 
     #[test]
@@ -4343,5 +5085,138 @@ mod std_tests {
     fn test_capacity_overflow_cap_really_isnt_isize() {
         let vec: ThinVec<u8> = ThinVec::with_capacity(isize::MAX as usize);
         assert!(vec.capacity() > 0);
+    }
+
+    mod drop_panic {
+        use super::*;
+        use std::cell::Cell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::rc::Rc;
+
+        /// Heap-owning element whose `Drop` optionally panics. Every drop is
+        /// recorded in `drops[id]`, so a double drop shows as a count above 1
+        /// (and as a double free of `_heap` under Miri or ASAN).
+        struct Bomb {
+            id: usize,
+            panics: bool,
+            _heap: Box<[u8; 16]>,
+            drops: Rc<Vec<Cell<u32>>>,
+        }
+
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.drops[self.id].set(self.drops[self.id].get() + 1);
+                if self.panics {
+                    panic!("bomb");
+                }
+            }
+        }
+
+        fn make(n: usize, panic_at: usize) -> (ThinVec<Bomb>, Rc<Vec<Cell<u32>>>) {
+            let drops = Rc::new((0..n).map(|_| Cell::new(0)).collect::<Vec<_>>());
+            let v = (0..n)
+                .map(|id| Bomb {
+                    id,
+                    panics: id == panic_at,
+                    _heap: Box::new([id as u8; 16]),
+                    drops: drops.clone(),
+                })
+                .collect();
+            (v, drops)
+        }
+
+        fn counts(drops: &Rc<Vec<Cell<u32>>>) -> Vec<u32> {
+            drops.iter().map(Cell::get).collect()
+        }
+
+        #[test]
+        fn clear_panic_drops_each_element_once() {
+            let (mut v, drops) = make(4, 1);
+            assert!(catch_unwind(AssertUnwindSafe(|| v.clear())).is_err());
+            assert_eq!(v.len(), 0);
+            drop(v);
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn into_iter_partial_next_panic_drops_each_element_once() {
+            // Element 0 is consumed by `next`; dropping the iterator drops 1..4,
+            // and element 2 panics.
+            let (v, drops) = make(4, 2);
+            let mut it = v.into_iter();
+            drop(it.next());
+            assert!(catch_unwind(AssertUnwindSafe(move || drop(it))).is_err());
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn into_iter_next_drop_of_item_panics() {
+            // The panic comes from the yielded item, not from the iterator drop.
+            let (v, drops) = make(3, 0);
+            let mut it = v.into_iter();
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(it.next()))).is_err());
+            drop(it);
+            assert_eq!(counts(&drops), [1, 1, 1]);
+        }
+
+        #[test]
+        fn truncate_panic_drops_each_element_once() {
+            let (mut v, drops) = make(4, 2);
+            assert!(catch_unwind(AssertUnwindSafe(|| v.truncate(1))).is_err());
+            assert_eq!(v.len(), 2);
+            drop(v);
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
+    }
+
+    struct PanicBomb(&'static str);
+
+    impl Drop for PanicBomb {
+        fn drop(&mut self) {
+            if self.0 == "panic" {
+                panic!("panic!");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "panic!")]
+    fn test_panic_into_iter() {
+        let mut v = ThinVec::new();
+        v.push(PanicBomb("normal1"));
+        v.push(PanicBomb("panic"));
+        v.push(PanicBomb("normal2"));
+
+        let mut iter = v.into_iter();
+        iter.next();
+    }
+
+    #[test]
+    #[should_panic(expected = "panic!")]
+    fn test_panic_clear() {
+        let mut v = ThinVec::new();
+        v.push(PanicBomb("normal1"));
+        v.push(PanicBomb("panic"));
+        v.push(PanicBomb("normal2"));
+        v.clear();
+    }
+
+    #[cfg(all(feature = "gecko-ffi", feature = "malloc_size_of"))]
+    #[test]
+    fn malloc_size_of_auto_array() {
+        use malloc_size_of::{MallocShallowSizeOf, MallocSizeOfOps};
+        use std::ffi::c_void;
+
+        extern "C" {
+            fn malloc_usable_size(ptr: *const c_void) -> usize;
+        }
+
+        unsafe extern "C" fn malloc_size_of(ptr: *const c_void) -> usize {
+            unsafe { malloc_usable_size(ptr) }
+        }
+
+        crate::auto_thin_vec!(let t: [u8; 4]);
+        let mut ops = MallocSizeOfOps::new(malloc_size_of, None, None);
+        let _ = MallocShallowSizeOf::shallow_size_of(&**t, &mut ops);
     }
 }
