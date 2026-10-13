@@ -1,7 +1,7 @@
 [package]
 edition     = "2021"
 name        = "thin-vec"
-version     = "0.2.13+eden"
+version     = "0.2.16+eden"
 authors     = ["Aria Beingessner <a.beingessner@gmail.com>", "Austin Rife <austin.rife@gmail.com>"]
 description = "A vec that takes up less space on the stack"
 license     = "MIT/Apache-2.0"
