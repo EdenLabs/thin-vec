@@ -1105,8 +1105,19 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// ```
     pub fn clear(&mut self) {
         unsafe {
-            ptr::drop_in_place(&mut self[..]);
-            self.set_len(0); // could be the singleton
+            // Set the length to 0 even if an element's `Drop` panics, so the
+            // container's own drop during unwinding does not drop them again.
+            struct DropGuard<'a, T, A: Allocator>(&'a mut ThinVec<T, A>);
+            impl<T, A: Allocator> Drop for DropGuard<'_, T, A> {
+                fn drop(&mut self) {
+                    unsafe {
+                        // Could be the singleton.
+                        self.0.set_len(0);
+                    }
+                }
+            }
+            let guard = DropGuard(self);
+            ptr::drop_in_place(&mut guard.0[..]);
         }
     }
 
@@ -4343,5 +4354,87 @@ mod std_tests {
     fn test_capacity_overflow_cap_really_isnt_isize() {
         let vec: ThinVec<u8> = ThinVec::with_capacity(isize::MAX as usize);
         assert!(vec.capacity() > 0);
+    }
+
+    mod drop_panic {
+        use super::*;
+        use std::cell::Cell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::rc::Rc;
+
+        /// Heap-owning element whose `Drop` optionally panics. Every drop is
+        /// recorded in `drops[id]`, so a double drop shows as a count above 1
+        /// (and as a double free of `_heap` under Miri or ASAN).
+        struct Bomb {
+            id: usize,
+            panics: bool,
+            _heap: Box<[u8; 16]>,
+            drops: Rc<Vec<Cell<u32>>>,
+        }
+
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.drops[self.id].set(self.drops[self.id].get() + 1);
+                if self.panics {
+                    panic!("bomb");
+                }
+            }
+        }
+
+        fn make(n: usize, panic_at: usize) -> (ThinVec<Bomb>, Rc<Vec<Cell<u32>>>) {
+            let drops = Rc::new((0..n).map(|_| Cell::new(0)).collect::<Vec<_>>());
+            let v = (0..n)
+                .map(|id| Bomb {
+                    id,
+                    panics: id == panic_at,
+                    _heap: Box::new([id as u8; 16]),
+                    drops: drops.clone(),
+                })
+                .collect();
+            (v, drops)
+        }
+
+        fn counts(drops: &Rc<Vec<Cell<u32>>>) -> Vec<u32> {
+            drops.iter().map(Cell::get).collect()
+        }
+
+        #[test]
+        fn clear_panic_drops_each_element_once() {
+            let (mut v, drops) = make(4, 1);
+            assert!(catch_unwind(AssertUnwindSafe(|| v.clear())).is_err());
+            assert_eq!(v.len(), 0);
+            drop(v);
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn into_iter_partial_next_panic_drops_each_element_once() {
+            // Element 0 is consumed by `next`; dropping the iterator drops 1..4,
+            // and element 2 panics.
+            let (v, drops) = make(4, 2);
+            let mut it = v.into_iter();
+            drop(it.next());
+            assert!(catch_unwind(AssertUnwindSafe(move || drop(it))).is_err());
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn into_iter_next_drop_of_item_panics() {
+            // The panic comes from the yielded item, not from the iterator drop.
+            let (v, drops) = make(3, 0);
+            let mut it = v.into_iter();
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(it.next()))).is_err());
+            drop(it);
+            assert_eq!(counts(&drops), [1, 1, 1]);
+        }
+
+        #[test]
+        fn truncate_panic_drops_each_element_once() {
+            let (mut v, drops) = make(4, 2);
+            assert!(catch_unwind(AssertUnwindSafe(|| v.truncate(1))).is_err());
+            assert_eq!(v.len(), 2);
+            drop(v);
+            assert_eq!(counts(&drops), [1, 1, 1, 1]);
+        }
     }
 }
