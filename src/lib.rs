@@ -679,6 +679,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// # Safety
     ///
     /// must have Self::is_zst() == false
+    #[allow(unused_unsafe)]
     unsafe fn ptr(&self) -> *mut Header {
         debug_assert!(!Self::is_zst());
         if self.is_singleton() {
@@ -692,6 +693,7 @@ impl<T, A: Allocator> ThinVec<T, A> {
     /// # Safety
     ///
     /// must have Self::is_zst() == false
+    #[allow(unused_unsafe)]
     unsafe fn header(&self) -> &Header {
         debug_assert!(!Self::is_zst());
         if self.is_singleton() {
